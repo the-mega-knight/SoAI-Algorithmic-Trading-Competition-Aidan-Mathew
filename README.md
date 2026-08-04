@@ -1,0 +1,1 @@
+# SoAI-Algorithmic-Trading-Competition-Aidan-Mathew
