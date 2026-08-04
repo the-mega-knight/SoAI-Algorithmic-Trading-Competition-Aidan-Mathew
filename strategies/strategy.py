@@ -40,6 +40,13 @@ The official execution environment imports the class defined here, so:
 * Keep the class name ``Strategy``.
 * Keep this file at ``strategies/strategy.py``.
 * Keep the import path ``from strategies.strategy import Strategy``.
+
+DEBUG (Aug 2026): a local backtest.py run produced 0 trades for the entire
+backtest window (portfolio stayed flat at the starting budget the whole
+run). Temporary [DEBUG] log_message calls have been added below in
+_get_daily_bars and on_trading_iteration's signal loop to find out exactly
+why `signals`/`qualifying` stayed empty. Remove these once the root cause
+is confirmed and fixed.
 """
 
 from lumibot.strategies import Strategy as _LumibotStrategy
@@ -68,6 +75,10 @@ class Strategy(_LumibotStrategy):
     # How much minute history to pull per iteration to build daily bars.
     # SLOW_SMA_DAYS + a safety margin, converted to minutes.
     _HISTORY_DAYS = max(SLOW_SMA_DAYS, MOMENTUM_LOOKBACK_DAYS, VOL_LOOKBACK_DAYS) + 10
+
+    # Set to False once the 0-trade root cause is found/fixed to silence
+    # the temporary debug logging added below.
+    _DEBUG_SIGNALS = True
 
     # ------------------------------------------------------------------
     # Lifecycle: setup
@@ -121,11 +132,28 @@ class Strategy(_LumibotStrategy):
         for symbol in self.CRYPTO_UNIVERSE:
             daily = self._get_daily_bars(symbol)
             if daily is None or len(daily) < self.SLOW_SMA_DAYS + 1:
+                if self._DEBUG_SIGNALS:
+                    got = 0 if daily is None else len(daily)
+                    self.log_message(
+                        f"[DEBUG] {symbol}: skipping, only {got} daily bars "
+                        f"after resample (need >= {self.SLOW_SMA_DAYS + 1}). "
+                        f"daily_is_none={daily is None}"
+                    )
                 continue  # not enough history yet - sit this one out
             signals[symbol] = self._compute_signal(daily)
 
         # -- Step 3: qualify assets with an active entry signal.
         qualifying = {s: v for s, v in signals.items() if v["entry"]}
+
+        if self._DEBUG_SIGNALS and signals and not qualifying:
+            self.log_message(
+                "[DEBUG] signals computed but none qualified: "
+                + ", ".join(
+                    f"{s}(sma_fast={v['sma_fast']:.2f}, sma_slow={v['sma_slow']:.2f}, "
+                    f"roc={v['roc']:.4f})"
+                    for s, v in signals.items()
+                )
+            )
 
         # -- Step 4: inverse-volatility weights among qualifying assets,
         #    capped per-asset and in total.
@@ -158,12 +186,23 @@ class Strategy(_LumibotStrategy):
         length_minutes = self._HISTORY_DAYS * 24 * 60
         bars = self.get_historical_prices(symbol, length_minutes, "minute")
         if bars is None or bars.df is None or bars.df.empty:
+            if self._DEBUG_SIGNALS:
+                self.log_message(
+                    f"[DEBUG] {symbol}: get_historical_prices({length_minutes} min) "
+                    f"returned {'None' if bars is None else 'empty df'}"
+                )
             return None
 
         df = bars.df
         daily = df.resample("1D").agg(
             {"open": "first", "high": "max", "low": "min", "close": "last", "volume": "sum"}
         ).dropna()
+        if self._DEBUG_SIGNALS:
+            self.log_message(
+                f"[DEBUG] {symbol}: pulled {len(df)} minute bars "
+                f"({df.index.min()} -> {df.index.max()}), resampled to "
+                f"{len(daily)} daily bars"
+            )
         return daily
 
     def _compute_signal(self, daily):
