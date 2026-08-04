@@ -41,15 +41,21 @@ The official execution environment imports the class defined here, so:
 * Keep this file at ``strategies/strategy.py``.
 * Keep the import path ``from strategies.strategy import Strategy``.
 
-DEBUG (Aug 2026): a local backtest.py run produced 0 trades for the entire
-backtest window (portfolio stayed flat at the starting budget the whole
-run). Temporary [DEBUG] log_message calls have been added below in
-_get_daily_bars and on_trading_iteration's signal loop to find out exactly
-why `signals`/`qualifying` stayed empty. Remove these once the root cause
-is confirmed and fixed.
+FIX (Aug 2026): a local backtest.py run produced 0 trades for the entire
+backtest window. Root cause: this file called get_historical_prices /
+get_last_price / get_position / create_order with bare symbol strings
+(e.g. "BTC"), which Lumibot defaults to a STOCK asset + FOREX USD quote.
+backtest.py registers each symbol as a CRYPTO asset paired with a CRYPTO
+USD quote, so the bare-string lookups matched nothing and every history
+pull silently returned None. Fixed by building real Asset objects (+ the
+matching quote) once in initialize() and using them everywhere below.
+DEBUG (_DEBUG_SIGNALS) logging from the investigation is left in for one
+more confirmation run -- turn it off (set to False) once real trades are
+confirmed in the log.
 """
 
 from lumibot.strategies import Strategy as _LumibotStrategy
+from lumibot.entities import Asset
 
 
 class Strategy(_LumibotStrategy):
@@ -76,8 +82,8 @@ class Strategy(_LumibotStrategy):
     # SLOW_SMA_DAYS + a safety margin, converted to minutes.
     _HISTORY_DAYS = max(SLOW_SMA_DAYS, MOMENTUM_LOOKBACK_DAYS, VOL_LOOKBACK_DAYS) + 10
 
-    # Set to False once the 0-trade root cause is found/fixed to silence
-    # the temporary debug logging added below.
+    # Set to False once trades are confirmed in the log to silence the
+    # temporary debug logging added while chasing the 0-trade bug.
     _DEBUG_SIGNALS = True
 
     # ------------------------------------------------------------------
@@ -85,6 +91,16 @@ class Strategy(_LumibotStrategy):
     # ------------------------------------------------------------------
     def initialize(self):
         self.sleeptime = "1D"
+
+        # Real Asset objects, matching exactly what backtest.py registers
+        # in pandas_data (CRYPTO type, paired with a CRYPTO USD quote).
+        # Using bare strings instead of these was the root cause of the
+        # 0-trade bug -- see module docstring.
+        self._quote_asset = Asset(symbol="USD", asset_type=Asset.AssetType.CRYPTO)
+        self._assets = {
+            symbol: Asset(symbol=symbol, asset_type=Asset.AssetType.CRYPTO)
+            for symbol in self.CRYPTO_UNIVERSE
+        }
 
         # Running peak portfolio value, for the drawdown circuit breaker.
         self.peak_portfolio_value = None
@@ -183,8 +199,9 @@ class Strategy(_LumibotStrategy):
         keeps behavior identical across the local Pandas/CSV backtest and
         the official minute-bar-only live feed.
         """
+        asset = self._assets[symbol]
         length_minutes = self._HISTORY_DAYS * 24 * 60
-        bars = self.get_historical_prices(symbol, length_minutes, "minute")
+        bars = self.get_historical_prices(asset, length_minutes, "minute", quote=self._quote_asset)
         if bars is None or bars.df is None or bars.df.empty:
             if self._DEBUG_SIGNALS:
                 self.log_message(
@@ -273,16 +290,18 @@ class Strategy(_LumibotStrategy):
     # Order execution
     # ------------------------------------------------------------------
     def _current_position_value(self, symbol):
-        position = self.get_position(symbol)
+        asset = self._assets[symbol]
+        position = self.get_position(asset)
         if position is None or position.quantity in (None, 0):
             return 0.0, 0.0
-        price = self.get_last_price(symbol)
+        price = self.get_last_price(asset, quote=self._quote_asset)
         if price is None:
             return float(position.quantity), 0.0
         return float(position.quantity), float(position.quantity) * float(price)
 
     def _rebalance_to_weight(self, symbol, target_weight, portfolio_value):
-        price = self.get_last_price(symbol)
+        asset = self._assets[symbol]
+        price = self.get_last_price(asset, quote=self._quote_asset)
         if price is None or price <= 0:
             return  # no tradable price this iteration - skip safely
 
@@ -300,18 +319,19 @@ class Strategy(_LumibotStrategy):
             delta_qty = min(delta_qty, affordable_qty)
             if delta_qty <= 0:
                 return
-            order = self.create_order(symbol, delta_qty, "buy")
+            order = self.create_order(asset, delta_qty, "buy", quote=self._quote_asset)
             self.submit_order(order)
         else:
             sell_qty = min(abs(delta_qty), current_qty) if current_qty else 0
             if sell_qty <= 0:
                 return
-            order = self.create_order(symbol, sell_qty, "sell")
+            order = self.create_order(asset, sell_qty, "sell", quote=self._quote_asset)
             self.submit_order(order)
 
     def _flatten_all(self):
         for symbol in self.CRYPTO_UNIVERSE:
+            asset = self._assets[symbol]
             qty, _ = self._current_position_value(symbol)
             if qty and qty > 0:
-                order = self.create_order(symbol, qty, "sell")
+                order = self.create_order(asset, qty, "sell", quote=self._quote_asset)
                 self.submit_order(order)
