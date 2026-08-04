@@ -10,26 +10,41 @@ qualifies at once, weighted inversely to its own recent volatility (so no
 single volatile name dominates portfolio risk), and drop it the instant
 the trend breaks.
 
-Every decision below is mechanical - no discretionary judgment calls, so
-the exact same inputs always produce the exact same output (a requirement
-for both honest backtesting and passing the official verification run).
+Every decision below is mechanical, with no discretionary judgment calls,
+so the same inputs always produce the same output. That is a requirement
+for both honest backtesting and for passing the official verification run.
 
 Rules (zero discretion)
 ------------------------
 Universe:        BTC, ETH, SOL (spot, USD-quoted; see CRYPTO_UNIVERSE)
 Cadence:         once per day (self.sleeptime = "1D")
 Entry signal:    SMA(10) > SMA(20)  AND  10-day ROC > 0
-Exit signal:     SMA(10) <= SMA(20)  (trend break -> flatten immediately)
+Exit signal:     SMA(10) <= SMA(20)  (trend break, flatten immediately)
 Position sizing: inverse-volatility weighting across assets with an active
                  entry signal, capped at MAX_ASSET_WEIGHT per asset and
                  MAX_TOTAL_EXPOSURE of the portfolio in total
-Risk control:    portfolio-level drawdown circuit breaker - if portfolio
-                 value drawns down more than MAX_DRAWDOWN_PCT from its
+Risk control:    portfolio-level drawdown circuit breaker. If portfolio
+                 value draws down more than MAX_DRAWDOWN_PCT from its
                  running peak, flatten everything and pause new entries
                  for DRAWDOWN_COOLDOWN_DAYS trading days
 Rebalance rule:  only trade an asset when the target position differs from
                  the current one by more than MIN_REBALANCE_PCT of
                  portfolio value, to avoid churning on noise
+
+Assets, quotes and market hours
+-------------------------------
+Lumibot resolves a bare symbol string such as "BTC" to a stock asset
+quoted in forex USD. This strategy trades crypto, so initialize() builds
+Asset objects with asset_type CRYPTO and passes them, along with the
+account quote asset, to every data and order call. The quote asset is
+whatever the runner configured (backtest.py hands one to run_backtest);
+the fallback is USD as a crypto asset. The asset and quote used here have
+to match the ones the price data was registered under, otherwise the
+history lookups return nothing and the strategy sits flat forever.
+
+Crypto trades continuously, so initialize() sets the market to 24/7.
+Left on the default NASDAQ calendar, the broker reports the market closed
+overnight and at weekends and the trading iteration is skipped.
 
 See the project README for the full writeup, and
 `trading-backtest-methodology` / `trading-position-sizer` /
@@ -40,18 +55,6 @@ The official execution environment imports the class defined here, so:
 * Keep the class name ``Strategy``.
 * Keep this file at ``strategies/strategy.py``.
 * Keep the import path ``from strategies.strategy import Strategy``.
-
-FIX (Aug 2026): a local backtest.py run produced 0 trades for the entire
-backtest window. Root cause: this file called get_historical_prices /
-get_last_price / get_position / create_order with bare symbol strings
-(e.g. "BTC"), which Lumibot defaults to a STOCK asset + FOREX USD quote.
-backtest.py registers each symbol as a CRYPTO asset paired with a CRYPTO
-USD quote, so the bare-string lookups matched nothing and every history
-pull silently returned None. Fixed by building real Asset objects (+ the
-matching quote) once in initialize() and using them everywhere below.
-DEBUG (_DEBUG_SIGNALS) logging from the investigation is left in for one
-more confirmation run -- turn it off (set to False) once real trades are
-confirmed in the log.
 """
 
 from lumibot.strategies import Strategy as _LumibotStrategy
@@ -60,8 +63,8 @@ from lumibot.entities import Asset
 
 class Strategy(_LumibotStrategy):
     # ------------------------------------------------------------------
-    # Tunable parameters (all part of the codified rule set above -
-    # changing these is "refine", not "add discretion", per the
+    # Tunable parameters (all part of the codified rule set above.
+    # Changing these is "refine", not "add discretion", per the
     # trading-backtest-methodology stress-testing workflow).
     # ------------------------------------------------------------------
     CRYPTO_UNIVERSE = ["BTC", "ETH", "SOL"]
@@ -79,12 +82,13 @@ class Strategy(_LumibotStrategy):
     DRAWDOWN_COOLDOWN_DAYS = 5    # trading days to stay flat after a trip
 
     # How much minute history to pull per iteration to build daily bars.
-    # SLOW_SMA_DAYS + a safety margin, converted to minutes.
+    # SLOW_SMA_DAYS plus a safety margin, converted to minutes.
     _HISTORY_DAYS = max(SLOW_SMA_DAYS, MOMENTUM_LOOKBACK_DAYS, VOL_LOOKBACK_DAYS) + 10
 
-    # Set to False once trades are confirmed in the log to silence the
-    # temporary debug logging added while chasing the 0-trade bug.
-    _DEBUG_SIGNALS = True
+    # Per-symbol, per-iteration logging of what the data layer returned.
+    # Useful when the strategy is not trading and you need to see whether
+    # history is arriving at all. Very noisy, so it stays off by default.
+    _DEBUG_SIGNALS = False
 
     # ------------------------------------------------------------------
     # Lifecycle: setup
@@ -92,12 +96,26 @@ class Strategy(_LumibotStrategy):
     def initialize(self):
         self.sleeptime = "1D"
 
-        # Real Asset objects, matching exactly what backtest.py registers
-        # in pandas_data (CRYPTO type, paired with a CRYPTO USD quote).
-        # Using bare strings instead of these was the root cause of the
-        # 0-trade bug -- see module docstring.
-        self._quote_asset = Asset(symbol="USD", asset_type=Asset.AssetType.CRYPTO)
-        self._assets = {
+        # Crypto has no session boundaries. On the default calendar the
+        # broker reports the market closed and the iteration is skipped.
+        try:
+            self.set_market("24/7")
+        except Exception as exc:  # pragma: no cover - depends on the runner
+            self.log_message(
+                f"Could not set the market to 24/7 ({exc}). Continuing on the "
+                f"runner default, which may skip iterations outside session hours."
+            )
+
+        # Read the account quote asset rather than assigning one. Lumibot
+        # sets its own _quote_asset during construction and registers the
+        # cash position against it, so replacing it here would strand that
+        # cash position and make get_cash() return None.
+        self._usd_quote = getattr(self, "_quote_asset", None) or Asset(
+            symbol="USD", asset_type=Asset.AssetType.CRYPTO
+        )
+
+        # Explicit crypto assets. A bare "BTC" string resolves to a stock.
+        self._trade_assets = {
             symbol: Asset(symbol=symbol, asset_type=Asset.AssetType.CRYPTO)
             for symbol in self.CRYPTO_UNIVERSE
         }
@@ -106,10 +124,13 @@ class Strategy(_LumibotStrategy):
         self.peak_portfolio_value = None
         # Trading days remaining in the post-breaker cooldown (0 = not in cooldown).
         self.cooldown_days_left = 0
+        # Last set of target weights written to the log, so the summary
+        # line only prints when the target allocation actually moves.
+        self._last_logged_weights = None
 
         self.log_message(
             f"Strategy initialized. Universe={self.CRYPTO_UNIVERSE}, "
-            f"sleeptime={self.sleeptime}"
+            f"sleeptime={self.sleeptime}, quote={self._usd_quote}"
         )
 
     # ------------------------------------------------------------------
@@ -117,6 +138,9 @@ class Strategy(_LumibotStrategy):
     # ------------------------------------------------------------------
     def on_trading_iteration(self):
         portfolio_value = self.get_portfolio_value()
+        if portfolio_value is None:
+            self.log_message("Portfolio value unavailable this iteration, skipping.")
+            return
 
         # -- Step 1: update the running peak and check the circuit breaker.
         if self.peak_portfolio_value is None or portfolio_value > self.peak_portfolio_value:
@@ -155,7 +179,7 @@ class Strategy(_LumibotStrategy):
                         f"after resample (need >= {self.SLOW_SMA_DAYS + 1}). "
                         f"daily_is_none={daily is None}"
                     )
-                continue  # not enough history yet - sit this one out
+                continue  # not enough history yet, sit this one out
             signals[symbol] = self._compute_signal(daily)
 
         # -- Step 3: qualify assets with an active entry signal.
@@ -183,25 +207,35 @@ class Strategy(_LumibotStrategy):
             target_weight = target_weights.get(symbol, 0.0)
             self._rebalance_to_weight(symbol, target_weight, portfolio_value)
 
-        self.log_message(
-            f"[Strategy] portfolio=${portfolio_value:,.2f} "
-            f"cash=${self.get_cash():,.2f} drawdown={drawdown:.1%} "
-            f"qualifying={list(qualifying.keys())} weights={target_weights}"
-        )
+        # The iteration summary is only worth a log line when the target
+        # allocation moved. Printing it every iteration buries the
+        # interesting entries and exits in thousands of identical rows.
+        rounded = {s: round(w, 4) for s, w in sorted(target_weights.items())}
+        if rounded != self._last_logged_weights:
+            self._last_logged_weights = rounded
+            cash = self.get_cash()
+            cash_text = f"${cash:,.2f}" if cash is not None else "unavailable"
+            self.log_message(
+                f"[Strategy] portfolio=${portfolio_value:,.2f} "
+                f"cash={cash_text} drawdown={drawdown:.1%} "
+                f"qualifying={list(qualifying.keys())} weights={rounded}"
+            )
 
     # ------------------------------------------------------------------
     # Signal computation
     # ------------------------------------------------------------------
     def _get_daily_bars(self, symbol):
         """
-        Pull minute bars and resample to daily OHLC ourselves, rather than
-        relying on the backtesting engine's own timestep resampling - this
+        Pull minute bars and resample to daily OHLC here, rather than
+        relying on the backtesting engine's own timestep resampling. This
         keeps behavior identical across the local Pandas/CSV backtest and
         the official minute-bar-only live feed.
         """
-        asset = self._assets[symbol]
+        asset = self._trade_assets[symbol]
         length_minutes = self._HISTORY_DAYS * 24 * 60
-        bars = self.get_historical_prices(asset, length_minutes, "minute", quote=self._quote_asset)
+        bars = self.get_historical_prices(
+            asset, length_minutes, "minute", quote=self._usd_quote
+        )
         if bars is None or bars.df is None or bars.df.empty:
             if self._DEBUG_SIGNALS:
                 self.log_message(
@@ -217,7 +251,7 @@ class Strategy(_LumibotStrategy):
         if self._DEBUG_SIGNALS:
             self.log_message(
                 f"[DEBUG] {symbol}: pulled {len(df)} minute bars "
-                f"({df.index.min()} -> {df.index.max()}), resampled to "
+                f"({df.index.min()} to {df.index.max()}), resampled to "
                 f"{len(daily)} daily bars"
             )
         return daily
@@ -290,48 +324,58 @@ class Strategy(_LumibotStrategy):
     # Order execution
     # ------------------------------------------------------------------
     def _current_position_value(self, symbol):
-        asset = self._assets[symbol]
+        asset = self._trade_assets[symbol]
         position = self.get_position(asset)
         if position is None or position.quantity in (None, 0):
             return 0.0, 0.0
-        price = self.get_last_price(asset, quote=self._quote_asset)
+        price = self.get_last_price(asset, quote=self._usd_quote)
         if price is None:
             return float(position.quantity), 0.0
         return float(position.quantity), float(position.quantity) * float(price)
 
     def _rebalance_to_weight(self, symbol, target_weight, portfolio_value):
-        asset = self._assets[symbol]
-        price = self.get_last_price(asset, quote=self._quote_asset)
+        asset = self._trade_assets[symbol]
+        price = self.get_last_price(asset, quote=self._usd_quote)
         if price is None or price <= 0:
-            return  # no tradable price this iteration - skip safely
+            return  # no tradable price this iteration, skip safely
 
         current_qty, current_value = self._current_position_value(symbol)
         target_value = target_weight * portfolio_value
         delta_value = target_value - current_value
 
         if abs(delta_value) < self.MIN_REBALANCE_PCT * max(portfolio_value, 1.0):
-            return  # inside the no-trade band - avoid churn/fees on noise
+            return  # inside the no-trade band, avoid churn and fees on noise
 
         delta_qty = delta_value / price
         if delta_qty > 0:
-            # Buying: never spend more than available cash.
-            affordable_qty = self.get_cash() / price
+            # Buying: never spend more than available cash. A None here
+            # means the broker could not report a balance, which is worth
+            # surfacing rather than silently sizing the order at zero.
+            cash = self.get_cash()
+            if cash is None:
+                self.log_message(
+                    f"get_cash() returned None while sizing a {symbol} buy. "
+                    f"Skipping this order. Check that the account quote asset "
+                    f"matches the quote the price data was registered under."
+                )
+                return
+            affordable_qty = cash / price
             delta_qty = min(delta_qty, affordable_qty)
             if delta_qty <= 0:
                 return
-            order = self.create_order(asset, delta_qty, "buy", quote=self._quote_asset)
+            order = self.create_order(asset, delta_qty, "buy", quote=self._usd_quote)
             self.submit_order(order)
         else:
             sell_qty = min(abs(delta_qty), current_qty) if current_qty else 0
             if sell_qty <= 0:
                 return
-            order = self.create_order(asset, sell_qty, "sell", quote=self._quote_asset)
+            order = self.create_order(asset, sell_qty, "sell", quote=self._usd_quote)
             self.submit_order(order)
 
     def _flatten_all(self):
         for symbol in self.CRYPTO_UNIVERSE:
-            asset = self._assets[symbol]
+            asset = self._trade_assets[symbol]
             qty, _ = self._current_position_value(symbol)
             if qty and qty > 0:
-                order = self.create_order(asset, qty, "sell", quote=self._quote_asset)
+                order = self.create_order(asset, qty, "sell", quote=self._usd_quote)
                 self.submit_order(order)
