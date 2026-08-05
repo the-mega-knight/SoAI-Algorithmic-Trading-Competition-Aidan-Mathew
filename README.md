@@ -16,95 +16,106 @@ level playing field.
 
 ---
 
-## ## Our Approach: Volatility-Scaled Crypto Momentum
+## Our Approach: Low-Turnover Momentum Core with Volatility/Gap Risk Throttle
 
 **Team**: Aidan & Mathew
 
-**One-sentence hypothesis**: crypto assets in a confirmed short-term uptrend
-(10-day SMA above 20-day SMA, with positive 10-day momentum) tend to keep
-trending long enough to be worth holding, so we hold every qualifying asset
-at once, sized inversely to its own recent volatility so no single volatile
-name dominates portfolio risk, and drop it the instant the trend breaks.
+**One-sentence hypothesis**: among a basket of large-cap US tech stocks,
+names showing sustained positive 30-day momentum tend to keep outperforming
+long enough to be worth holding through short-term noise, so the strategy
+stays close to fully invested and rebalances only weekly, while a separate
+daily-checked volatility/gap throttle cuts exposure to any name showing an
+abnormal move.
 
-**Universe**: BTC, ETH, SOL (spot, USD-quoted, via CCXT) — a small,
-liquid crypto sleeve chosen because it has the deepest free historical data
-for local backtesting and is directly supported by the official CCXT feed.
+**Universe**: AAPL, MSFT, GOOGL, AMZN, NVDA. Five liquid, large-cap US
+equities, chosen for data availability and familiarity.
 
-**Cadence**: once per day (`self.sleeptime = "1D"`). We resample the
-official minute-bar feed to daily bars ourselves inside the strategy, so
-behavior is identical whether the underlying feed is minute (official) or
-whatever granularity a local CSV provides.
+**Why this design, and not daily trend-following**: two earlier versions of
+this strategy (a crypto momentum version, then a daily SMA-crossover version
+on this same equity universe) were both validated against real historical
+data and both underperformed simple buy-and-hold by a wide margin. The
+common cause was heavy turnover from daily binary entry/exit trading, mostly
+whipsaw on short-term noise rather than genuine trend changes, with fees
+eating a large share of the return. Every version tested pointed the same
+direction: staying invested consistently beat trading in and out. This
+version is built around that result.
+
+**Cadence**: checked once per day (`self.sleeptime = "1D"`), but the target
+allocation is only *recomputed* every 5 trading days. The risk throttle
+(below) still runs every day regardless of the rebalance schedule.
 
 **Rules (fully mechanical, no discretionary judgment calls)**:
-- **Entry**: `SMA(10) > SMA(20)` AND `10-day rate of change > 0`
-- **Exit**: `SMA(10) <= SMA(20)` (trend break → flatten that asset immediately)
-- **Sizing**: inverse-volatility weighting across every asset with an active
-  entry signal, capped at 50% of the portfolio per asset and 90% total
-  exposure (10% cash buffer at all times)
-- **Risk control**: a portfolio-level drawdown circuit breaker — if the
+- **Entry signal**: 30-day rate of change > 0
+- **Weighting**: proportional to each qualifying name's own ROC (not
+  inverse-volatility, which was found to penalize exactly the strongest
+  movers), capped at 40% of the portfolio per name and 98% total exposure
+- **Risk throttle** (checked daily, OHLCV-only): halves a name's weight if
+  its 20-day realized volatility exceeds 1.8x its own 60-day baseline, and
+  cuts it to 30% for 3 trading days after a >5% overnight gap. This is a
+  reactive, OHLCV-only stand-in for earnings/shock awareness. The official
+  feed provides OHLCV bars only, no news or calendar data, so a strategy
+  that depended on knowing earnings dates in advance would not be reliably
+  reproducible in the official environment.
+- **Risk control**: a portfolio-level drawdown circuit breaker. If the
   portfolio falls more than 25% from its running peak, flatten everything
-  and pause new entries for 5 trading days
-- **No-trade band**: only rebalance an asset when the target position
-  differs from the current one by more than 2% of portfolio value, to avoid
-  churning (and paying fees) on noise
+  and pause new entries for 5 trading days. When cooldown ends, the peak
+  resets to the recovery value rather than the pre-crash high, so the
+  breaker cannot permanently lock the strategy out of the market after a
+  single drawdown (a bug caught and fixed during validation).
+- **No-trade band**: only rebalance a name when the target position
+  differs from the current one by more than 2% of portfolio value
 
-**Why this design**: the competition scores a single Terminal Return with no
-path-dependent scoring, but a strategy that blows up mid-window can't
-recover before the window closes — so we weighted robustness (volatility
-scaling, hard exits, a circuit breaker) above squeezing out extra average
-return. This follows the stress-test-first methodology in
-`trading-backtest-methodology`.
-
-**Local validation**: `data/` ships with synthetic (regime-switching,
-mean-reverting) 1-minute OHLCV for BTC/ETH/SOL, generated locally because
-this development sandbox could not reach live exchange APIs — clearly not
-real market data, and **not used for the official score** (the organizers
-re-run everything on the real CCXT/Massive feed). Against this synthetic
-data (`python backtest.py`, or the standalone `vector_validate.py` sanity
-check included in this repo), the strategy showed:
-- A **plateau** of positive Sharpe (roughly 5–8) across a fast/slow SMA
-  grid from (5,15) through (15,30) — no single narrow "lucky" parameter
-  spike, which is the main thing the backtest-expert stress-testing
-  methodology asks us to check for.
-- Max drawdown in the ~9–13% range, well inside the 25% circuit-breaker
-  threshold in every run so far.
-- Uneven performance across sub-periods of the synthetic series (one third
-  negative, one strongly positive, one flat) — a reminder that this is a
-  trend-following strategy and will underperform in a genuinely sideways
-  regime. We view this as the main open risk, not a solved problem.
+**Local validation on real historical data** (`vector_validate.py`, a
+from-scratch pandas re-implementation of the same rules, cross-checked
+against `python backtest.py` running the real Lumibot engine):
+- **+73.1% terminal return, Sharpe 1.70, Sortino 2.75, max drawdown -15.9%**
+  over a real ~436-day window (real daily OHLCV pulled via yfinance). A
+  separate full 2-year Lumibot run confirmed the same direction: +107%
+  total return, Sharpe 1.95, max drawdown -15.0%, against a +46% AAPL-only
+  benchmark over the same period.
+- Positive in **all three** sub-period thirds (+17.4%, +35.0%, +7.3%), not
+  dependent on one lucky stretch.
+- The parameter grid around these settings (30-day momentum lookback,
+  5-day rebalance) forms a genuine plateau of strong Sharpe ratios rather
+  than an isolated spike, and doubling transaction fees only costs about
+  4 points of return. Both are signs the result isn't curve-fit to this
+  specific window.
+- Beats 4 of the 5 individual buy-and-hold benchmarks over the same window
+  (AAPL +39.5%, MSFT +21.4%, AMZN +39.1%, NVDA +51.7%), with a much
+  shallower drawdown than any single concentrated position would carry. It
+  does not beat GOOGL's standalone +123.9% buy-and-hold, which used no
+  diversification or risk control at all.
 
 **Known limitations, stated plainly**:
-- Only ~39 usable days of (synthetic) history after the SMA warm-up period —
-  below the 100+ trade / multi-year sample size the backtest-expert
-  methodology recommends for real confidence. Treat all metrics above as
-  directional, not final.
-- The synthetic data is not real market data; before relying on this for
-  the actual submission, re-validate `strategies/strategy.py` against
-  `python backtest.py` with real historical CSVs once real data is
-  available (see §6 below for how to source it) or, ideally, once
-  `pip install -r requirements.txt` completes on a machine that can reach
-  live data providers.
-- `strategies/strategy.py` has not yet been run end-to-end against the real
-  Lumibot engine in this environment (the sandbox that built this repo
-  could not complete a full `pip install lumibot` in a reasonable time) —
-  its logic was independently re-validated via `vector_validate.py`, a
-  from-scratch pandas re-implementation of the exact same rules, but
-  running the real `python backtest.py` once before the 9 Aug submission
-  deadline is a hard requirement, not optional.
+- All validation above is against **historical** data ending in early
+  August 2026. The official scored window (16 August - 15 September 2026)
+  has not happened yet at the time of writing, and nothing guarantees it
+  resembles the backtested period.
+- The drawdown circuit breaker has not fired in real-data validation (max
+  drawdown stayed at -15.9%, short of the 25% threshold), so whether it
+  works as intended in an actual severe drawdown is still unconfirmed on
+  real data.
+- Five large-cap tech names are meaningfully correlated with each other;
+  the strategy does not diversify across sectors or asset classes even
+  though the competition permits a much wider universe (any CCXT crypto
+  pair, or the full US equity universe via Massive).
+- `requirements.txt` should be pinned to exact installed versions
+  (`pip freeze`) before final submission, per the competition's stated
+  reproducibility requirement.
 
 ---
 
-1) Competition at a Glance
+## 1) Competition at a Glance
 
 | Item | Value |
 | --- | --- |
-| Code submission deadline | **25 July 2026, 23:59:59 SGT (UTC+8)** |
-| Verification & test run | 26–28 July 2026 (SGT) |
-| Official trading period | 1 August 2026, 00:00:00 → 31 August 2026, 23:59:59 (SGT) |
-| Winners announcement | 6 September 2026 (SGT) |
-| Primary evaluation metric | **Terminal Return** (final portfolio return after full liquidation at the end of the trading window) |
+| Code submission deadline | **9 August 2026, 23:59:59 SGT (UTC+8)** |
+| Verification & test run | 10–12 August 2026 (SGT) |
+| Official trading period | 16 August 2026, 00:00:00 → 15 September 2026, 23:59:59 (SGT) |
+| Winners announcement | 18 September 2026 (SGT) |
+| Primary evaluation metric | **Terminal Return** (final portfolio value after full liquidation at the end of the trading window) |
 | Total prize pool | **SGD 3,000** |
-| Eligibility | Open worldwide; individuals or teams of 2–5 |
+| Eligibility | Open worldwide; individuals or teams of 1–5 |
 | Contact | info@soc-ai.org |
 
 > ⚠️ **Prize condition (strict):** cash prizes are awarded only to winners who
@@ -119,19 +130,22 @@ For the full call for participation, see the conference page:
 ## 2) Repository Layout
 
 ```text
-SoAI-2026-AI-Algorithmic-Trading-Competition/
+SoAI-Algorithmic-Trading-Competition-Aidan-Mathew/
 ├── README.md
 ├── LICENSE
 ├── requirements.txt
 ├── .gitignore
-├── backtest.py                       # local backtest entrypoint (pandas / CSV)
+├── backtest.py                       # local backtest entrypoint (pandas / CSV, daily bars)
+├── vector_validate.py                # independent pandas re-implementation for fast iteration
 ├── strategies/
-│   ├── strategy.py                   # YOUR strategy (official entrypoint)
+│   ├── strategy.py                   # OUR strategy (official entrypoint)
 │   ├── params.py                     # shared parameters for local backtests
 │   ├── example_strategy_1.py         # reference: daily DCA into SPY
 │   └── example_strategy_2.py         # reference: one-shot buy & hold
+├── scripts/
+│   └── fetch_stock_data.py           # pulls real daily OHLCV via yfinance into data/
 └── data/
-    └── EXAMPLE_1m_spot.csv           # placeholder minute-bar CSV
+    └── {SYMBOL}_daily.csv            # real daily OHLCV per symbol (gitignored; regenerate locally)
 ```
 
 Files the official environment relies on:
@@ -144,9 +158,9 @@ Files the official environment relies on:
 - **`README.md`** — keep a short, accurate description of your approach so
   reviewers can reproduce it.
 
-Everything else (the `backtest.py` harness, the `data/` folder, the example
-strategies) is provided for **your local development only** and is not used
-by the official evaluation.
+Everything else (the `backtest.py` / `vector_validate.py` harnesses, the
+`data/` folder, the example strategies) is provided for **your local
+development only** and is not used by the official evaluation.
 
 ---
 
@@ -232,7 +246,10 @@ Useful Lumibot documentation:
 
 We believe in the power of AI to find signal in the noise. For SoAI 2026
 the trading universe is **completely open** — from blue chips to penny
-stocks, from BTC to meme coins, if it has data, you can trade it.
+stocks, from BTC to meme coins, if it has data, you can trade it. This
+repo's strategy deliberately trades a small five-stock universe (see
+"Our Approach" above) rather than the full available universe, as a
+conscious build-time and reliability tradeoff.
 
 A symbol is eligible if it satisfies **both** of the following:
 
@@ -246,13 +263,13 @@ A symbol is eligible if it satisfies **both** of the following:
      Covers the full US public market: large caps (AAPL, MSFT, NVDA,
      TSLA), every ETF (SPY, QQQ, SMH, ARKK, TQQQ, UVXY, …), Chinese ADRs
      (BABA, PDD, TSM, ASML), and small / micro-cap / penny stocks.
-2. **You can source its 1-minute historical data** for your local
-   backtest.
+2. **You can source its historical data** for your local backtest.
 
-### 📡 Official data source providers (August 2026 run)
+### 📡 Official data source providers (August–September 2026 run)
 
-During the verification run (26–28 July 2026) and the official trading
-window (1–31 August 2026, SGT), every submission receives bars from:
+During the verification run (10–12 August 2026) and the official trading
+window (16 August – 15 September 2026, SGT), every submission receives
+bars from:
 
 - **CCXT** for crypto spot pairs.
 - **Massive** for US equities and ETFs.
@@ -277,70 +294,52 @@ unforgiving. Plan for the following gotchas before submission:
    at the top of the file). The official engine layers stricter,
    volume-aware constraints on top — treat your local results as an
    optimistic upper bound.
-3. **Free 1-minute history is scarce for US equities.** CCXT happily
-   serves years of minute bars for crypto, but free US-equity feeds
-   (e.g. Yahoo) typically expose only a few days of intraday data. If
-   you trade equities locally, you may need paid coverage (Polygon,
-   Alpaca premium, DataBento, etc.). The organizers handle data during
-   the August run — you only need historical data for local development.
+3. **Free 1-minute history is scarce for US equities.** Free equity feeds
+   (e.g. Yahoo/yfinance) typically expose only a few days of intraday
+   data, which is why this repo's local backtest uses daily bars instead
+   (see §6). The organizers handle minute-resolution data during the
+   official run — you only need historical data for local development.
 4. **Survivorship bias.** Penny stocks and small-cap altcoins delist or
    go to zero frequently. The historical datasets you pull in 2026 will
    be missing many tickers that were tradable earlier — train your
    models with that in mind. The official trading universe is whatever
-   is *live and listed* during August 2026.
+   is *live and listed* during the trading window.
 
 ---
 
 ## 6) Local Backtesting
 
-This template ships with a ready-to-run **Pandas / CSV** backtest. Lumibot
-also supports several other backtest modes — pick whichever fits the data
-you already have access to. The official competition score is **not**
-computed from any local backtest; this section is purely for your own
+This repo ships two local validation paths: a **Pandas / CSV** Lumibot
+backtest (`backtest.py`) and a **from-scratch pandas re-implementation**
+(`vector_validate.py`) used for fast parameter iteration and stress-testing
+without needing a full Lumibot install. The official competition score is
+**not** computed from either; this section is purely for your own
 development.
 
 Top-level reference: [Lumibot backtesting overview](https://lumibot.lumiwealth.com/backtesting.html).
 
-### 5.1 Default mode — Pandas (CSV minute bars)
+### 6.1 `backtest.py` — Pandas (CSV daily bars)
 
 The bundled harness uses Lumibot's
 [`PandasDataBacktesting`](https://lumibot.lumiwealth.com/backtesting.pandas.html)
-mode against minute-bar CSVs stored in [`data/`](data/).
+mode against **daily-bar** CSVs stored in [`data/`](data/) (this repo's
+strategy trades on a daily cadence, so daily bars are sufficient locally;
+the official feed itself remains minute-resolution per §8).
 
 #### Data format
 
 Each symbol you want to backtest must have a CSV at
-`data/{SYMBOL}_1m_spot.csv` with the following columns:
+`data/{SYMBOL}_daily.csv` with the following columns:
 
 | Column | Description |
 | --- | --- |
-| `open`, `high`, `low`, `close` | Minute-bar OHLC prices |
+| `open`, `high`, `low`, `close` | Daily OHLC prices |
 | `volume` | Traded volume |
-| `timestamp` | Bar close timestamp, ISO-8601 with timezone (UTC) |
+| `timestamp` | Bar date, ISO-8601 |
 
-The repository ships with one placeholder file
-(`data/EXAMPLE_1m_spot.csv`, constant price = 400, covering 1–29 Aug 2026)
-so the harness runs end-to-end out of the box. Replace it (or add more
-files) with realistic data of your choosing for local development —
-historical CSVs are **not** used by the official evaluation.
-
-> 📌 **The shape of [`data/EXAMPLE_1m_spot.csv`](data/EXAMPLE_1m_spot.csv)
-> is canonical.** It reflects exactly what the official environment will
-> feed your strategy: minute-resolution OHLCV bars per symbol, nothing
-> else (no order-book depth, no macro factors, no alternative data). See
-> [§8 — Evaluation & Fairness](#8-evaluation--fairness) for the full
-> data-feed contract.
-
-#### Choose your universe
-
-Edit [`strategies/params.py`](strategies/params.py) to list the symbols you
-want the local backtest to load:
-
-```python
-STOCK_SLEEVE_SYMBOLS = ["EXAMPLE"]   # add your tickers
-CRYPTO_SLEEVE_SYMBOLS = []           # add crypto symbols (e.g. "BTC")
-STOCK_BENCH = "EXAMPLE"              # benchmark line on the tearsheet
-```
+Run `python scripts/fetch_stock_data.py` to pull real data via `yfinance`
+for the symbols listed in `strategies/params.py` (data/ is gitignored, so
+a fresh clone needs to regenerate it before backtesting).
 
 #### Run
 
@@ -355,11 +354,23 @@ CSV, and a logs CSV — see
 for the full list. Adjust budget, fees, slippage, and the date window at
 the top of [`backtest.py`](backtest.py).
 
-### 5.2 Other Lumibot backtest modes
+### 6.2 `vector_validate.py` — fast pandas re-implementation
 
-Lumibot supports five additional backtest modes besides the Pandas/CSV
-default — pick one that matches the asset class and data source you
-prefer:
+```bash
+python vector_validate.py
+```
+
+Runs the same decision rules as `strategies/strategy.py`, independently
+re-derived in plain pandas, against the same daily CSVs. Prints a baseline
+run, a parameter sensitivity grid, stress tests (2x fees, circuit breaker
+disabled), sub-period robustness, and a buy-and-hold benchmark comparison,
+the full workflow from `trading-backtest-methodology`. Useful for
+iterating quickly since it doesn't require a Lumibot install.
+
+### 6.3 Other Lumibot backtest modes
+
+Lumibot supports several other backtest modes — pick one that matches the
+asset class and data source you prefer:
 
 | Mode | Best for | Cost | Docs |
 | --- | --- | --- | --- |
@@ -370,50 +381,13 @@ prefer:
 | **ThetaData** | Stocks / options / index, intraday | Subscription | [ThetaData](https://lumibot.lumiwealth.com/backtesting.thetadata.html) |
 | **Interactive Brokers (REST)** | Futures, crypto via IBKR Gateway | IBKR account | [IBKR REST](https://lumibot.lumiwealth.com/backtesting.interactive_brokers_rest.html) |
 
-The quickest alternative to the CSV mode is **Yahoo**, which fetches daily
-data from Yahoo! Finance with zero API keys. Save the snippet below as
-`backtest_yahoo.py` next to `backtest.py` and run it:
+### 6.4 Fetching market data
 
-```python
-from datetime import datetime
-
-from lumibot.backtesting import YahooDataBacktesting
-
-from strategies.strategy import Strategy
-
-Strategy.run_backtest(
-    YahooDataBacktesting,
-    backtesting_start=datetime(2026, 1, 1),
-    backtesting_end=datetime(2026, 8, 29),
-    budget=1_000_000,
-    benchmark_asset="SPY",
-)
-```
-
-> Yahoo backtests are **daily-only**, so set `self.sleeptime = "1D"`
-> (or larger) inside your strategy's `initialize` when using this mode.
-
-### 5.3 Fetching market data
-
-You have three practical options:
-
-1. **Bring your own CSVs.** Drop minute-bar files into `data/` using the
-   format described in section 5.1. This works offline and is the default
-   path supported by `backtest.py`.
-2. **Let Lumibot pull data on the fly.** The Yahoo / Polygon / DataBento /
-   ThetaData / IBKR REST modes pull data for you — follow the per-mode
-   docs above for the API keys or accounts each one needs.
-3. **Build a one-off downloader.** Write a small script using
-   [`yfinance`](https://pypi.org/project/yfinance/),
-   [`ccxt`](https://pypi.org/project/ccxt/), or any vendor SDK that
-   writes `{SYMBOL}_1m_spot.csv` files into `data/`, then run
-   `python backtest.py`. The example CSV bundled with the template shows
-   the exact columns and timestamp format expected.
-
-Whatever you pick, remember the **fairness rule**: the data your local
-backtest sees does not influence the official score — every submission is
-re-executed in the organizers' standardized environment over the official
-trading window.
+This repo uses `scripts/fetch_stock_data.py` (yfinance, daily bars, no API
+key needed). Whatever source you use, remember the **fairness rule**: the
+data your local backtest sees does not influence the official score —
+every submission is re-executed in the organizers' standardized
+environment over the official trading window.
 
 ---
 
@@ -439,15 +413,17 @@ To be considered for the competition you must:
 6. Update this `README.md` with a short description of your approach so
    reviewers can understand and reproduce it.
 7. Submit the repository link before the deadline:
-   **25 July 2026, 23:59:59 SGT (UTC+8)**.
+   **9 August 2026, 23:59:59 SGT (UTC+8)**, via the competition site's
+   submission form and registration flow (separate from pushing to GitHub).
 
 ### Submission Checklist
 
-- [ ] `strategies/strategy.py` contains a runnable `Strategy` class.
-- [ ] `python backtest.py` runs end-to-end on a clean clone (after
-      `pip install -r requirements.txt`).
-- [ ] `requirements.txt` lists all dependencies with compatible versions.
-- [ ] README describes the approach in plain language.
+- [x] `strategies/strategy.py` contains a runnable `Strategy` class.
+- [x] `python backtest.py` runs end-to-end on a clean clone (after
+      `pip install -r requirements.txt` and `python scripts/fetch_stock_data.py`).
+- [ ] `requirements.txt` lists all dependencies with pinned versions
+      (currently unpinned, run `pip freeze` before final submission).
+- [x] README describes the approach in plain language.
 - [ ] No secrets, no `.env`, no large binary blobs committed.
 - [ ] Repository link submitted via the official registration form.
 
@@ -459,8 +435,8 @@ To be considered for the competition you must:
   technical team in a standardized environment over the official trading
   window. This removes latency advantages, hardware differences, and
   execution bias between participants.
-- **Primary metric: Terminal Return** — the final portfolio return after
-  full liquidation at **31 August 2026, 23:59:59 SGT**.
+- **Primary metric: Terminal Return** — the final portfolio value after
+  full liquidation at **15 September 2026, 23:59:59 SGT**.
 - **Only results generated by the official system are valid.** Self-reported
   backtest numbers do not count toward the leaderboard.
 
@@ -470,7 +446,7 @@ The official environment supports **minute-, hourly-, and daily-level**
 strategies, controlled via `self.sleeptime` (e.g. `"1M"`, `"5M"`, `"15M"`,
 `"60M"`, `"1D"`). **Sub-minute (tick / second-level) scheduling is not
 supported** — submissions that attempt it will be rejected during
-verification (26–28 July 2026, SGT).
+verification (10–12 August 2026, SGT).
 
 ### Official data feed
 
@@ -478,17 +454,14 @@ Your strategy is fed **OHLCV bars only** (open, high, low, close, volume)
 during the official run. There is **no order-book / Level-2 depth, no
 tick data, no macroeconomic series, no news feed, and no alternative-data
 source**. Bars are delivered at minute resolution per symbol; you can
-choose to resample to hourly or daily inside your strategy.
+choose to resample to hourly or daily inside your strategy (this repo's
+strategy requests daily bars directly via `get_historical_prices(symbol,
+N, "day")`, one of the explicitly supported cadences).
 
 Bars are sourced via **CCXT** (crypto spot pairs) and **Massive** (US
 equities and ETFs) — see [§5 — Asset Universe & Data Sources](#5-asset-universe--data-sources)
 for the full tradable universe and the liquidity / data caveats that come
 with it.
-
-The file [`data/EXAMPLE_1m_spot.csv`](data/EXAMPLE_1m_spot.csv) shows the
-**exact shape** of the production feed — treat it as the canonical
-example when you design your features, your data-loading code, and your
-training pipeline.
 
 > 🛡️ Because every team sees the same minimal information set, the
 > winning strategies are the ones that stay **robust across regimes**
@@ -503,12 +476,13 @@ training pipeline.
 - **`ModuleNotFoundError`** — make sure your virtual environment is active
   and `pip install -r requirements.txt` has succeeded.
 - **`No valid CSV data loaded from data/`** — confirm your CSV filenames
-  match `{SYMBOL}_1m_spot.csv` and that the columns include
-  `open, high, low, close, volume, timestamp`.
+  match `{SYMBOL}_daily.csv` and that the columns include
+  `open, high, low, close, volume, timestamp`. Run
+  `python scripts/fetch_stock_data.py` if `data/` is empty (it's gitignored).
 - **`No overlapping datetime range across loaded symbols`** — your CSVs do
   not share an overlapping time window. Either widen the data or adjust
   `BACKTEST_START` / `BACKTEST_END` in `backtest.py`.
-- **Strategy import errors during official verification (26–28 July 2026)** —
+- **Strategy import errors during official verification (10–12 August 2026)** —
   re-test from a clean clone, fix any path / dependency issues, and push the
   fix before the verification window closes.
 

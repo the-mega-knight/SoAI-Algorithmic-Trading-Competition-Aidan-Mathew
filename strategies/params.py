@@ -6,28 +6,22 @@ IntelligenceX technical team and may expose its own universe. This file
 controls the *local* backtest harness only (``backtest.py``), so you can
 iterate quickly during development.
 
-Our strategy trades a crypto-only universe (BTC, ETH, SOL) - see
-``strategies/strategy.py`` for the full rule set. STOCK_SLEEVE_SYMBOLS is
-intentionally empty; STOCK_BENCH is pointed at BTC purely so the
-Lumibot tearsheet has a benchmark line to compare against (the "STOCK_"
-prefix is just the template's naming, not a claim that BTC is an equity).
+Our strategy trades a large-cap US equity universe - see
+``strategies/strategy.py`` for the full rule set.
 """
 
-# Equity / spot tickers traded by the local backtest. Empty: this strategy
-# is crypto-only.
-STOCK_SLEEVE_SYMBOLS: list[str] = []
+# Equity tickers traded by the strategy and the local backtest. Each needs
+# a matching data/{SYMBOL}_daily.csv (see scripts/fetch_stock_data.py).
+STOCK_SLEEVE_SYMBOLS: list[str] = ["AAPL", "MSFT", "GOOGL", "AMZN", "NVDA"]
 
-# Crypto tickers (quoted in USD), matching Strategy.CRYPTO_UNIVERSE in
-# strategies/strategy.py. Each needs a matching data/{SYMBOL}_1m_spot.csv.
-CRYPTO_SLEEVE_SYMBOLS: list[str] = ["BTC", "ETH", "SOL"]
+# No crypto sleeve in this version of the strategy.
+CRYPTO_SLEEVE_SYMBOLS: list[str] = []
 
-# Benchmark symbols used by Lumibot to render the comparison line on the
-# generated tearsheet HTML. backtest.py only wires up STOCK_BENCH, so we
-# point it at BTC (loaded via the crypto CSV) to get a meaningful benchmark.
-STOCK_BENCH: str = "BTC"
-CRYPTO_BENCH: str = "BTC"
+# Benchmark symbol used by Lumibot to render the comparison line on the
+# generated tearsheet HTML.
+STOCK_BENCH: str = "AAPL"
+CRYPTO_BENCH: str = "AAPL"
 
-# Derived set used by ``backtest.py`` to decide whether a loaded symbol
-# should be modelled as ``Asset.AssetType.CRYPTO`` vs ``STOCK``. Do not
-# edit directly; change ``CRYPTO_SLEEVE_SYMBOLS`` instead.
+# Derived set used by ``backtest.py``. Empty here since there's no crypto
+# sleeve; kept so backtest.py's classification logic still works untouched.
 CRYPTO_SYMBOLS: set[str] = set(CRYPTO_SLEEVE_SYMBOLS)
