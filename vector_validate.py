@@ -3,20 +3,13 @@ Independent vectorized re-implementation of the strategy's decision rules,
 used to validate + stress-test the logic (per trading-backtest-methodology)
 without depending on a full Lumibot install in this sandbox.
 
-v3: low-turnover momentum core + OHLCV-only volatility/gap risk throttle.
-See the commit message / README for the full reasoning. In short: v1
-(daily binary trend-following on crypto) and v2 (daily binary trend-
-following on stocks, then a first attempt at reducing turnover) both lost
-to simple buy-and-hold on real data. This version is built directly around
-that finding - stay close to fully invested, rebalance infrequently, and
-use volatility/gap spikes (not a forbidden external calendar) as the sole
-risk-reduction trigger between rebalances.
+v3.1: low-turnover momentum core + OHLCV-only volatility/gap risk throttle,
+with the circuit-breaker peak-reset fix. See strategies/strategy.py's
+module docstring and README.md for the full reasoning.
 
-v3.1: fixed a circuit-breaker lockout bug where the drawdown "peak" never
-reset after a breaker trip, permanently locking the strategy out of the
-market the first time it drew down 25% (see commit message for the full
-diagnosis). Also moved the default mom_lookback to 30, the strongest
-clean (non-contaminated) result found in the v3 grid search.
+run_backtest() now accepts optional start_date/end_date so the same logic
+can be scored against specific historical windows without re-loading data -
+see regime_test.py, which runs this across several distinct market regimes.
 """
 import numpy as np
 import pandas as pd
@@ -81,7 +74,7 @@ def momentum_weights(pos_roc, max_asset_weight, max_total_exposure):
     return {s: w * max_total_exposure for s, w in weights.items()}
 
 
-def run_backtest(params, start_cash=1_000_000, verbose=False):
+def run_backtest(params, start_cash=1_000_000, verbose=False, start_date=None, end_date=None):
     daily = {s: load_daily(s) for s in UNIVERSE}
     common_index = None
     for s in UNIVERSE:
@@ -122,6 +115,10 @@ def run_backtest(params, start_cash=1_000_000, verbose=False):
     force_rebalance = True
 
     dates = common_index[WARMUP_DAYS:]
+    if start_date is not None:
+        dates = dates[dates >= pd.Timestamp(start_date)]
+    if end_date is not None:
+        dates = dates[dates <= pd.Timestamp(end_date)]
 
     def _flatten_and_reset():
         nonlocal cash, trade_count, base_weights, force_rebalance
@@ -145,10 +142,6 @@ def run_backtest(params, start_cash=1_000_000, verbose=False):
             cooldown -= 1
             _flatten_and_reset()
             if cooldown == 0:
-                # Reset the drawdown reference point to the recovery
-                # value, not the stale pre-crash peak - otherwise cash
-                # sitting idle never climbs back to the old peak and the
-                # very next check re-triggers the breaker permanently.
                 peak = port_value
             equity_curve.append((dt, cash))
             continue
@@ -159,8 +152,6 @@ def run_backtest(params, start_cash=1_000_000, verbose=False):
             equity_curve.append((dt, cash))
             continue
 
-        # -- rebalance schedule: recompute target composition only every
-        #    N trading days (or immediately after a breaker reset)
         if force_rebalance or (day_index % params["rebalance_every"] == 0):
             pos_roc = {
                 s: sig[s].loc[dt, "roc"] for s in UNIVERSE
@@ -170,8 +161,6 @@ def run_backtest(params, start_cash=1_000_000, verbose=False):
             force_rebalance = False
         day_index += 1
 
-        # -- daily risk throttle: applied every day regardless of rebalance
-        #    schedule, using only OHLCV-derived signals (vol spike, gap)
         target_weights = {}
         for s in UNIVERSE:
             w = base_weights.get(s, 0.0)

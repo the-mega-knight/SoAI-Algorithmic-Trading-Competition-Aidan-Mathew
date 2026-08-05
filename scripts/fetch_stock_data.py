@@ -6,7 +6,10 @@ os.makedirs("data", exist_ok=True)
 symbols = ["AAPL", "MSFT", "GOOGL", "AMZN", "NVDA"]
 
 for symbol in symbols:
-    df = yf.download(symbol, period="2y", interval="1d", auto_adjust=True, progress=False)
+    # 10y instead of 2y: daily bars don't have the short intraday-history
+    # limits minute bars do, so pulling more history is free and lets us
+    # test the strategy across multiple market regimes (see regime_test.py).
+    df = yf.download(symbol, period="10y", interval="1d", auto_adjust=True, progress=False)
     df = df.reset_index()
     df.columns = [c[0] if isinstance(c, tuple) else c for c in df.columns]
     df = df.rename(columns={
