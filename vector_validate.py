@@ -11,6 +11,12 @@ to simple buy-and-hold on real data. This version is built directly around
 that finding - stay close to fully invested, rebalance infrequently, and
 use volatility/gap spikes (not a forbidden external calendar) as the sole
 risk-reduction trigger between rebalances.
+
+v3.1: fixed a circuit-breaker lockout bug where the drawdown "peak" never
+reset after a breaker trip, permanently locking the strategy out of the
+market the first time it drew down 25% (see commit message for the full
+diagnosis). Also moved the default mom_lookback to 30, the strongest
+clean (non-contaminated) result found in the v3 grid search.
 """
 import numpy as np
 import pandas as pd
@@ -28,7 +34,7 @@ UNIVERSE = ["AAPL", "MSFT", "GOOGL", "AMZN", "NVDA"]
 WARMUP_DAYS = 65
 
 DEFAULT_PARAMS = dict(
-    mom_lookback=20,
+    mom_lookback=30,
     rebalance_every=5,
     vol_lookback=20,
     vol_baseline_days=60,
@@ -138,6 +144,12 @@ def run_backtest(params, start_cash=1_000_000, verbose=False):
         if cooldown > 0:
             cooldown -= 1
             _flatten_and_reset()
+            if cooldown == 0:
+                # Reset the drawdown reference point to the recovery
+                # value, not the stale pre-crash peak - otherwise cash
+                # sitting idle never climbs back to the old peak and the
+                # very next check re-triggers the breaker permanently.
+                peak = port_value
             equity_curve.append((dt, cash))
             continue
 
@@ -241,7 +253,7 @@ def run_backtest(params, start_cash=1_000_000, verbose=False):
 
 
 if __name__ == "__main__":
-    print("=== Baseline run (v3: weekly momentum core + vol/gap throttle) ===")
+    print("=== Baseline run (v3.1: fixed breaker lockout, mom_lookback=30) ===")
     result, ec = run_backtest(DEFAULT_PARAMS, verbose=True)
 
     print("\n=== Grid: mom_lookback x rebalance_every ===")
