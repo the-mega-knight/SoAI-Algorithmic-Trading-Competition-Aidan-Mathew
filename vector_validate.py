@@ -3,13 +3,17 @@ Independent vectorized re-implementation of the strategy's decision rules,
 used to validate + stress-test the logic (per trading-backtest-methodology)
 without depending on a full Lumibot install in this sandbox.
 
-This is NOT the official backtest (that's backtest.py, driven by the real
-Lumibot engine) -- it's a from-scratch pandas re-derivation of the exact
-same rules in strategies/strategy.py, run against the same CSVs, so we can
-sanity-check behavior and stress-test parameters quickly. Both
-implementations should be checked for agreement once `python backtest.py`
-can actually be run (e.g. on a machine where the full lumibot install
-completes).
+v2 changes from the original momentum strategy, per the underperformance-vs-
+buy-and-hold diagnosis:
+  - Added a 100-day regime filter: only enter when price is above its own
+    100-day SMA, to avoid trading noise in non-trending stretches.
+  - Added a 2-day exit confirmation: a single-day trend break no longer
+    flattens the position immediately, cutting whipsaw round-trips.
+  - Switched sizing from inverse-volatility to momentum-weighted (weight
+    proportional to recent ROC), so strong trends get more capital instead
+    of being penalized for their own volatility.
+  - Raised MAX_ASSET_WEIGHT and MAX_TOTAL_EXPOSURE since the two filters
+    above should reduce the need for such conservative caps.
 """
 import numpy as np
 import pandas as pd
@@ -18,33 +22,31 @@ import itertools
 import json
 
 DATA_DIR = Path(__file__).resolve().parent / "data"
-UNIVERSE = ["BTC", "ETH", "SOL"]
+UNIVERSE = ["AAPL", "MSFT", "GOOGL", "AMZN", "NVDA"]
 
 DEFAULT_PARAMS = dict(
-    fast=10, slow=20, mom=10, vol_lookback=20,
-    max_asset_weight=0.50, max_total_exposure=0.90,
+    fast=15, slow=25, mom=10, vol_lookback=20, regime_days=100,
+    exit_confirm_days=2,
+    max_asset_weight=0.65, max_total_exposure=0.98,
     min_rebalance_pct=0.02, max_drawdown_pct=0.25, cooldown_days=5,
     fee_bps=2.0,  # matches the official 2bps fee stated on the competition site
 )
 
 
 def load_daily(symbol):
-    df = pd.read_csv(DATA_DIR / f"{symbol}_1m_spot.csv", parse_dates=["timestamp"])
+    df = pd.read_csv(DATA_DIR / f"{symbol}_daily.csv", parse_dates=["timestamp"])
     df = df.set_index("timestamp").sort_index()
-    daily = df.resample("1D").agg(
-        {"open": "first", "high": "max", "low": "min", "close": "last", "volume": "sum"}
-    ).dropna()
-    return daily
+    return df[["open", "high", "low", "close", "volume"]]
 
 
-def inverse_vol_weights(qualifying_vol, max_asset_weight, max_total_exposure):
-    if not qualifying_vol:
+def momentum_weights(qualifying_roc, max_asset_weight, max_total_exposure):
+    if not qualifying_roc:
         return {}
-    inv_vol = {s: 1.0 / v for s, v in qualifying_vol.items() if v > 0}
-    total = sum(inv_vol.values())
+    scores = {s: max(v, 1e-6) for s, v in qualifying_roc.items()}
+    total = sum(scores.values())
     if total <= 0:
         return {}
-    weights = {s: w / total for s, w in inv_vol.items()}
+    weights = {s: sc / total for s, sc in scores.items()}
     for _ in range(len(weights) + 1):
         over = {s: w for s, w in weights.items() if w > max_asset_weight}
         if not over:
@@ -69,28 +71,49 @@ def run_backtest(params, start_cash=1_000_000, verbose=False):
         common_index = idx if common_index is None else common_index.intersection(idx)
     common_index = common_index.sort_values()
 
-    fast, slow, mom, vol_lb = params["fast"], params["slow"], params["mom"], params["vol_lookback"]
+    fast, slow, mom = params["fast"], params["slow"], params["mom"]
+    vol_lb, regime_days = params["vol_lookback"], params["regime_days"]
+
     sig = {}
     for s in UNIVERSE:
         close = daily[s]["close"].reindex(common_index)
         sma_fast = close.rolling(fast).mean()
         sma_slow = close.rolling(slow).mean()
+        sma_regime = close.rolling(regime_days).mean()
         roc = close.pct_change(periods=mom)
         daily_ret = close.pct_change()
         vol = daily_ret.rolling(vol_lb).std()
-        entry = (sma_fast > sma_slow) & (roc > 0)
-        sig[s] = pd.DataFrame({"close": close, "entry": entry, "vol": vol})
+
+        entry_raw = (sma_fast > sma_slow) & (roc > 0) & (close > sma_regime)
+        exit_raw = (sma_fast <= sma_slow)
+
+        sig[s] = pd.DataFrame({
+            "close": close, "entry_raw": entry_raw, "exit_raw": exit_raw,
+            "roc": roc, "vol": vol,
+        })
 
     cash = start_cash
     qty = {s: 0.0 for s in UNIVERSE}
+    in_position = {s: False for s in UNIVERSE}
+    exit_streak = {s: 0 for s in UNIVERSE}
     equity_curve = []
     peak = start_cash
     cooldown = 0
     trade_count = 0
     fee_rate = params["fee_bps"] / 10_000.0
 
-    warmup = max(fast, slow, mom, vol_lb) + 1
+    warmup = max(fast, slow, mom, vol_lb, regime_days) + 1
     dates = common_index[warmup:]
+
+    def _flatten_and_reset():
+        nonlocal cash, trade_count
+        for s in UNIVERSE:
+            if qty[s] > 0:
+                cash += qty[s] * prices[s] * (1 - fee_rate)
+                trade_count += 1
+                qty[s] = 0.0
+            in_position[s] = False
+            exit_streak[s] = 0
 
     for dt in dates:
         prices = {s: sig[s].loc[dt, "close"] for s in UNIVERSE}
@@ -101,29 +124,39 @@ def run_backtest(params, start_cash=1_000_000, verbose=False):
 
         if cooldown > 0:
             cooldown -= 1
-            for s in UNIVERSE:
-                if qty[s] > 0:
-                    cash += qty[s] * prices[s] * (1 - fee_rate)
-                    trade_count += 1
-                    qty[s] = 0.0
+            _flatten_and_reset()
             equity_curve.append((dt, cash))
             continue
 
         if drawdown <= -params["max_drawdown_pct"]:
-            for s in UNIVERSE:
-                if qty[s] > 0:
-                    cash += qty[s] * prices[s] * (1 - fee_rate)
-                    trade_count += 1
-                    qty[s] = 0.0
+            _flatten_and_reset()
             cooldown = params["cooldown_days"]
             equity_curve.append((dt, cash))
             continue
 
-        qualifying_vol = {
-            s: sig[s].loc[dt, "vol"] for s in UNIVERSE
-            if bool(sig[s].loc[dt, "entry"]) and sig[s].loc[dt, "vol"] > 0
+        # -- hysteresis: update in_position / exit_streak per asset
+        for s in UNIVERSE:
+            row = sig[s].loc[dt]
+            if pd.isna(row["entry_raw"]) or pd.isna(row["exit_raw"]):
+                continue  # not enough history yet for this asset
+            if not in_position[s]:
+                if bool(row["entry_raw"]):
+                    in_position[s] = True
+                    exit_streak[s] = 0
+            else:
+                if bool(row["exit_raw"]):
+                    exit_streak[s] += 1
+                else:
+                    exit_streak[s] = 0
+                if exit_streak[s] >= params["exit_confirm_days"]:
+                    in_position[s] = False
+                    exit_streak[s] = 0
+
+        qualifying_roc = {
+            s: sig[s].loc[dt, "roc"] for s in UNIVERSE
+            if in_position[s] and sig[s].loc[dt, "roc"] == sig[s].loc[dt, "roc"]
         }
-        weights = inverse_vol_weights(qualifying_vol, params["max_asset_weight"], params["max_total_exposure"])
+        weights = momentum_weights(qualifying_roc, params["max_asset_weight"], params["max_total_exposure"])
 
         for s in UNIVERSE:
             target_w = weights.get(s, 0.0)
@@ -164,7 +197,7 @@ def run_backtest(params, start_cash=1_000_000, verbose=False):
     ec = pd.Series({d: v for d, v in equity_curve}).sort_index()
     returns = ec.pct_change().dropna()
 
-    ann_factor = 365  # crypto trades every day
+    ann_factor = 252
     sharpe = np.sqrt(ann_factor) * returns.mean() / returns.std() if returns.std() > 0 else np.nan
     downside = returns[returns < 0]
     sortino = np.sqrt(ann_factor) * returns.mean() / downside.std() if len(downside) and downside.std() > 0 else np.nan
@@ -188,12 +221,12 @@ def run_backtest(params, start_cash=1_000_000, verbose=False):
 
 
 if __name__ == "__main__":
-    print("=== Baseline run (default params) ===")
+    print("=== Baseline run (v2: regime filter + exit confirm + momentum weighting) ===")
     result, ec = run_backtest(DEFAULT_PARAMS, verbose=True)
 
-    print("\n=== Parameter sensitivity grid (fast/slow SMA) ===")
+    print("\n=== Parameter sensitivity grid (fast/slow SMA, tighter band around 15/25) ===")
     grid_results = []
-    for fast, slow in itertools.product([5, 8, 10, 12, 15], [15, 20, 25, 30]):
+    for fast, slow in itertools.product([10, 12, 13, 14, 15, 16, 17, 18, 20], [20, 22, 24, 25, 26, 28, 30, 32, 35]):
         if fast >= slow:
             continue
         p = dict(DEFAULT_PARAMS)
@@ -205,14 +238,28 @@ if __name__ == "__main__":
     pd.set_option("display.width", 120)
     print(grid_df.to_string(index=False))
 
+    print("\n=== Sensitivity: exit_confirm_days (1, 2, 3) ===")
+    for d in [1, 2, 3]:
+        p = dict(DEFAULT_PARAMS)
+        p["exit_confirm_days"] = d
+        r, _ = run_backtest(p)
+        print(f"exit_confirm_days={d}: {json.dumps(r)}")
+
+    print("\n=== Sensitivity: regime_days (50, 100, 150) ===")
+    for d in [50, 100, 150]:
+        p = dict(DEFAULT_PARAMS)
+        p["regime_days"] = d
+        r, _ = run_backtest(p)
+        print(f"regime_days={d}: {json.dumps(r)}")
+
     print("\n=== Stress test: 2x slippage/fee ===")
     p_stress = dict(DEFAULT_PARAMS)
-    p_stress["fee_bps"] = DEFAULT_PARAMS["fee_bps"] * 4  # crude stand-in for slippage+fee friction
+    p_stress["fee_bps"] = DEFAULT_PARAMS["fee_bps"] * 4
     result_stress, _ = run_backtest(p_stress, verbose=True)
 
     print("\n=== Stress test: no drawdown circuit breaker ===")
     p_nobreaker = dict(DEFAULT_PARAMS)
-    p_nobreaker["max_drawdown_pct"] = 1.0  # effectively disables it
+    p_nobreaker["max_drawdown_pct"] = 1.0
     result_nobreaker, _ = run_backtest(p_nobreaker, verbose=True)
 
     print("\n=== Sub-period robustness (split data into thirds) ===")
@@ -224,3 +271,10 @@ if __name__ == "__main__":
             continue
         seg_return = seg.iloc[-1] / seg.iloc[0] - 1
         print(f"{label}: {seg_return:.2%} over {len(seg)} days")
+
+    print("\n=== Buy & hold benchmark (equal weight, no trading) ===")
+    for s in UNIVERSE:
+        d = load_daily(s)
+        close = d["close"].reindex(ec.index).dropna()
+        bh_return = close.iloc[-1] / close.iloc[0] - 1
+        print(f"{s}: {bh_return:.2%} buy & hold over {len(close)} days")
