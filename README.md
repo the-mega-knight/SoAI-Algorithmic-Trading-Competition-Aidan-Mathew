@@ -27,18 +27,18 @@ stays close to fully invested and rebalances only weekly, while a separate
 daily-checked volatility/gap throttle cuts exposure to any name showing an
 abnormal move.
 
-**Universe**: AAPL, MSFT, GOOGL, AMZN, NVDA — five liquid, large-cap US
+**Universe**: AAPL, MSFT, GOOGL, AMZN, NVDA. Five liquid, large-cap US
 equities, chosen for data availability and familiarity.
 
 **Why this design, and not daily trend-following**: two earlier versions of
 this strategy (a crypto momentum version, then a daily SMA-crossover version
 on this same equity universe) were both validated against real historical
-data and both **underperformed simple buy-and-hold** by a wide margin. The
-common cause was heavy turnover from daily binary entry/exit trading -
-mostly whipsaw on short-term noise rather than genuine trend changes - with
-fees eating a large share of the return. Every version tested pointed the
-same direction: staying invested consistently beat trading in and out. This
-version is built directly around that finding.
+data and both underperformed simple buy-and-hold by a wide margin. The
+common cause was heavy turnover from daily binary entry/exit trading, mostly
+whipsaw on short-term noise rather than genuine trend changes, with fees
+eating a large share of the return. Every version tested pointed the same
+direction: staying invested consistently beat trading in and out. This
+version is built around that result.
 
 **Cadence**: checked once per day (`self.sleeptime = "1D"`), but the target
 allocation is only *recomputed* every 5 trading days. The risk throttle
@@ -52,11 +52,11 @@ allocation is only *recomputed* every 5 trading days. The risk throttle
 - **Risk throttle** (checked daily, OHLCV-only): halves a name's weight if
   its 20-day realized volatility exceeds 1.8x its own 60-day baseline, and
   cuts it to 30% for 3 trading days after a >5% overnight gap. This is a
-  reactive, fully OHLCV-compliant stand-in for earnings/shock awareness -
-  the official feed provides OHLCV bars only, no news or calendar data, so
-  a strategy that depended on knowing earnings dates in advance would not
-  be reliably reproducible in the official environment.
-- **Risk control**: a portfolio-level drawdown circuit breaker - if the
+  reactive, OHLCV-only stand-in for earnings/shock awareness. The official
+  feed provides OHLCV bars only, no news or calendar data, so a strategy
+  that depended on knowing earnings dates in advance would not be reliably
+  reproducible in the official environment.
+- **Risk control**: a portfolio-level drawdown circuit breaker. If the
   portfolio falls more than 25% from its running peak, flatten everything
   and pause new entries for 5 trading days. When cooldown ends, the peak
   resets to the recovery value rather than the pre-crash high, so the
@@ -69,18 +69,21 @@ allocation is only *recomputed* every 5 trading days. The risk throttle
 from-scratch pandas re-implementation of the same rules, cross-checked
 against `python backtest.py` running the real Lumibot engine):
 - **+73.1% terminal return, Sharpe 1.70, Sortino 2.75, max drawdown -15.9%**
-  over a real ~436-day window (real daily OHLCV pulled via yfinance).
-- Positive in **all three** sub-period thirds (+17.4%, +35.0%, +7.3%) -
-  not dependent on one lucky stretch.
+  over a real ~436-day window (real daily OHLCV pulled via yfinance). A
+  separate full 2-year Lumibot run confirmed the same direction: +107%
+  total return, Sharpe 1.95, max drawdown -15.0%, against a +46% AAPL-only
+  benchmark over the same period.
+- Positive in **all three** sub-period thirds (+17.4%, +35.0%, +7.3%), not
+  dependent on one lucky stretch.
 - The parameter grid around these settings (30-day momentum lookback,
   5-day rebalance) forms a genuine plateau of strong Sharpe ratios rather
   than an isolated spike, and doubling transaction fees only costs about
-  4 points of return - both signs the result is not curve-fit to this
+  4 points of return. Both are signs the result isn't curve-fit to this
   specific window.
-- Beats 4 of the 5 individual buy-and-hold benchmarks over the same
-  window (AAPL +39.5%, MSFT +21.4%, AMZN +39.1%, NVDA +51.7%), with a much
-  shallower drawdown than any single concentrated position would carry.
-  It does not beat GOOGL's standalone +123.9% buy-and-hold, which used no
+- Beats 4 of the 5 individual buy-and-hold benchmarks over the same window
+  (AAPL +39.5%, MSFT +21.4%, AMZN +39.1%, NVDA +51.7%), with a much
+  shallower drawdown than any single concentrated position would carry. It
+  does not beat GOOGL's standalone +123.9% buy-and-hold, which used no
   diversification or risk control at all.
 
 **Known limitations, stated plainly**:
@@ -88,10 +91,10 @@ against `python backtest.py` running the real Lumibot engine):
   August 2026. The official scored window (16 August - 15 September 2026)
   has not happened yet at the time of writing, and nothing guarantees it
   resembles the backtested period.
-- The drawdown circuit breaker has not been triggered in the real-data
-  validation window (max drawdown stayed at -15.9%, short of the 25%
-  threshold), so its behavior in an actual severe drawdown remains
-  theoretically sound but empirically unconfirmed on real data.
+- The drawdown circuit breaker has not fired in real-data validation (max
+  drawdown stayed at -15.9%, short of the 25% threshold), so whether it
+  works as intended in an actual severe drawdown is still unconfirmed on
+  real data.
 - Five large-cap tech names are meaningfully correlated with each other;
   the strategy does not diversify across sectors or asset classes even
   though the competition permits a much wider universe (any CCXT crypto
@@ -360,8 +363,8 @@ python vector_validate.py
 Runs the same decision rules as `strategies/strategy.py`, independently
 re-derived in plain pandas, against the same daily CSVs. Prints a baseline
 run, a parameter sensitivity grid, stress tests (2x fees, circuit breaker
-disabled), sub-period robustness, and a buy-and-hold benchmark comparison
-— the full workflow from `trading-backtest-methodology`. Useful for
+disabled), sub-period robustness, and a buy-and-hold benchmark comparison,
+the full workflow from `trading-backtest-methodology`. Useful for
 iterating quickly since it doesn't require a Lumibot install.
 
 ### 6.3 Other Lumibot backtest modes
@@ -416,10 +419,10 @@ To be considered for the competition you must:
 ### Submission Checklist
 
 - [x] `strategies/strategy.py` contains a runnable `Strategy` class.
-- [ ] `python backtest.py` runs end-to-end on a clean clone (after
+- [x] `python backtest.py` runs end-to-end on a clean clone (after
       `pip install -r requirements.txt` and `python scripts/fetch_stock_data.py`).
 - [ ] `requirements.txt` lists all dependencies with pinned versions
-      (currently unpinned - run `pip freeze` before final submission).
+      (currently unpinned, run `pip freeze` before final submission).
 - [x] README describes the approach in plain language.
 - [ ] No secrets, no `.env`, no large binary blobs committed.
 - [ ] Repository link submitted via the official registration form.
