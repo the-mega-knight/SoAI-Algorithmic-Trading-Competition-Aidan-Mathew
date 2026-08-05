@@ -3,13 +3,19 @@ Independent vectorized re-implementation of the strategy's decision rules,
 used to validate + stress-test the logic (per trading-backtest-methodology)
 without depending on a full Lumibot install in this sandbox.
 
-v3.1: low-turnover momentum core + OHLCV-only volatility/gap risk throttle,
-with the circuit-breaker peak-reset fix. See strategies/strategy.py's
-module docstring and README.md for the full reasoning.
+v3.2: loosened the daily volatility/gap risk throttle and raised exposure
+caps after a multi-regime test (see regime_test.py) showed the tighter
+v3.1 throttle was giving up too much upside in strong bull markets - it
+was reacting to routine volatility upticks, not just genuine stress. The
+circuit breaker (25% drawdown flatten), not the daily throttle, was what
+won the 2022 bear-market regime test, so this loosening should not give
+back that protection. See strategies/strategy.py's module docstring and
+README.md for the fuller reasoning.
 
-run_backtest() now accepts optional start_date/end_date so the same logic
-can be scored against specific historical windows without re-loading data -
-see regime_test.py, which runs this across several distinct market regimes.
+run_backtest() accepts optional start_date/end_date so the same logic can
+be scored against specific historical windows without re-loading data -
+see regime_test.py, which runs this across several distinct market
+regimes.
 """
 import numpy as np
 import pandas as pd
@@ -31,13 +37,13 @@ DEFAULT_PARAMS = dict(
     rebalance_every=5,
     vol_lookback=20,
     vol_baseline_days=60,
-    vol_spike_multiplier=1.8,
-    vol_throttle_factor=0.5,
+    vol_spike_multiplier=2.3,
+    vol_throttle_factor=0.7,
     gap_threshold_pct=0.05,
-    gap_throttle_factor=0.3,
+    gap_throttle_factor=0.5,
     gap_cooldown_days=3,
-    max_asset_weight=0.40,
-    max_total_exposure=0.98,
+    max_asset_weight=0.50,
+    max_total_exposure=1.0,
     min_rebalance_pct=0.02,
     max_drawdown_pct=0.25,
     cooldown_days=5,
@@ -242,7 +248,7 @@ def run_backtest(params, start_cash=1_000_000, verbose=False, start_date=None, e
 
 
 if __name__ == "__main__":
-    print("=== Baseline run (v3.1: fixed breaker lockout, mom_lookback=30) ===")
+    print("=== Baseline run (v3.2: loosened throttle + higher exposure caps) ===")
     result, ec = run_backtest(DEFAULT_PARAMS, verbose=True)
 
     print("\n=== Grid: mom_lookback x rebalance_every ===")
@@ -257,8 +263,8 @@ if __name__ == "__main__":
     pd.set_option("display.width", 120)
     print(grid_df.to_string(index=False))
 
-    print("\n=== Sensitivity: vol_spike_multiplier (1.5, 1.8, 2.2) ===")
-    for m in [1.5, 1.8, 2.2]:
+    print("\n=== Sensitivity: vol_spike_multiplier (1.8, 2.3, 2.8) ===")
+    for m in [1.8, 2.3, 2.8]:
         p = dict(DEFAULT_PARAMS)
         p["vol_spike_multiplier"] = m
         r, _ = run_backtest(p)
