@@ -3,7 +3,7 @@ Local backtest entrypoint for the SoAI 2026 AI Algorithmic Trading Competition.
 
 What this file does
 -------------------
-* Loads minute-bar CSVs for the symbol universe declared in
+* Loads daily-bar CSVs for the symbol universe declared in
   ``strategies/params.py``.
 * Runs the strategy defined in ``strategies/strategy.py`` against that
   data using Lumibot's :class:`PandasDataBacktesting` engine.
@@ -12,13 +12,11 @@ What this file does
 
 Quick start
 -----------
-1. Activate your virtual environment and install dependencies
-   (see ``README.md``).
-2. Generate or download a CSV named ``{SYMBOL}_1m_spot.csv`` for every
+1. Install dependencies (see ``README.md``).
+2. Generate or download a CSV named ``{SYMBOL}_daily.csv`` for every
    symbol you want to trade into the ``data/`` folder. Required columns:
    ``open, high, low, close, volume, timestamp`` (timestamp ISO-8601 UTC).
-   ``scripts/generate_synthetic_data.py`` writes synthetic files for local
-   development.
+   ``scripts/fetch_stock_data.py`` pulls real data via yfinance.
 3. List those symbols in ``strategies/params.py``.
 4. Run::
 
@@ -51,68 +49,39 @@ from strategies.strategy import Strategy
 # Configurable settings - edit these to match your local environment.
 # ---------------------------------------------------------------------------
 
-# Directory containing the CSV bar files. Each symbol must have a file named
-# ``{SYMBOL}_1m_spot.csv`` here. Required columns: open, high, low, close,
-# volume, timestamp (UTC, ISO-8601).
 DATA_DIR = Path(__file__).resolve().parent / "data"
 
-# Starting cash for the backtest, in the quote currency below.
 BUDGET = 1_000_000
 
-# The account quote asset. Lumibot holds cash as a position in this asset
-# and uses it to resolve crypto pairs, so it has to be the same asset the
-# price data is registered under in _load_pandas_data(). A mismatch is
-# quiet rather than loud: history lookups return nothing, get_cash()
-# returns None, and the strategy sits flat for the whole run.
-QUOTE_ASSET = Asset(symbol="USD", asset_type=Asset.AssetType.CRYPTO)
+# The account quote asset for equities: USD as a forex pair, which is what
+# a bare stock symbol resolves against by default.
+QUOTE_ASSET = Asset(symbol="USD", asset_type=Asset.AssetType.FOREX)
 
 # Backtest window, both bounds inclusive. Leave either as None to use the
 # full range available in the CSV files.
-#
-# A window that falls outside the data range shrinks the run instead of
-# failing, because the harness intersects the two. A window of 1 to 29
-# August against CSVs that end on 4 August leaves four days, well short of
-# the 20 days of history the slow SMA needs before it can produce a signal.
-# The "Backtest window" line printed at the start of a run shows the range
-# actually used.
 BACKTEST_START: datetime | None = None
 BACKTEST_END: datetime | None = None
 
-# When True, the harness aborts if a symbol declared in ``params.py`` has
-# no matching CSV in ``DATA_DIR``. When False the symbol is skipped with a
-# warning, which is useful while iterating on a subset of the universe.
 STRICT_MISSING_SYMBOLS = False
-
-# Lumibot logs at INFO on every iteration. Set True for a quieter run.
 QUIET_LOGS = False
 
 
 # ---------------------------------------------------------------------------
 # Execution-cost model - fees and slippage charged on every fill.
 # ---------------------------------------------------------------------------
-# Set USE_CUSTOM_EXECUTION_COSTS = False to fall back to Lumibot defaults.
-# See the Trading Fee / Slippage docs linked in the module docstring for the
-# exact semantics of each field.
-#
 # The competition charges a uniform 2 basis points on all trades across both
-# asset classes, so BUY_PERCENT_FEE and SELL_PERCENT_FEE are set to 0.0002
-# to approximate official execution locally.
+# asset classes.
 
 USE_CUSTOM_EXECUTION_COSTS = True
 
-# Per-trade flat fee charged on every fill (quote currency).
 BUY_FLAT_FEE = 0.0
 SELL_FLAT_FEE = 0.0
 
-# Fee as a fraction of trade notional. 0.0002 == 2 basis points.
 BUY_PERCENT_FEE = 0.0002
 SELL_PERCENT_FEE = 0.0002
 
-# Per-contract fee (only relevant for options / futures).
 PER_CONTRACT_FEE = 0.0
 
-# Per-share slippage in price units, applied in the adverse direction
-# (buys fill higher, sells fill lower).
 BUY_SLIPPAGE_AMOUNT = 0.0
 SELL_SLIPPAGE_AMOUNT = 0.0
 
@@ -122,7 +91,6 @@ SELL_SLIPPAGE_AMOUNT = 0.0
 # ---------------------------------------------------------------------------
 
 def _execution_cost_kwargs() -> dict:
-    """Build Lumibot-compatible fee/slippage kwargs for ``run_backtest``."""
     if not USE_CUSTOM_EXECUTION_COSTS:
         return {}
 
@@ -152,17 +120,10 @@ def _execution_cost_kwargs() -> dict:
 
 
 def _normalize_symbol(symbol: str) -> str:
-    """Translate a symbol into a filesystem-safe filename stem."""
     return symbol.replace("/", "_").replace("\\", "_").replace(".", "_")
 
 
 def _read_raw_csv(path: Path) -> pd.DataFrame:
-    """
-    Read a minute-bar CSV into the shape Lumibot's Pandas backtester expects.
-
-    Returns a DataFrame indexed by timezone-aware (UTC) datetimes with the
-    five OHLCV columns in canonical order.
-    """
     df = pd.read_csv(path, usecols=["open", "high", "low", "close", "volume", "timestamp"])
     df["datetime"] = pd.to_datetime(df["timestamp"], utc=True, errors="coerce")
     df = df.dropna(subset=["datetime"]).drop(columns=["timestamp"])
@@ -171,34 +132,20 @@ def _read_raw_csv(path: Path) -> pd.DataFrame:
 
 
 def _as_utc(dt: datetime) -> datetime:
-    """Return a timezone-aware UTC datetime for safe comparisons."""
     if dt.tzinfo is None:
         return dt.replace(tzinfo=timezone.utc)
     return dt.astimezone(timezone.utc)
 
 
-def _load_pandas_data() -> tuple[dict[Asset, Data], list[pd.Timestamp], list[pd.Timestamp], list[str]]:
-    """
-    Build the ``{Asset: Data}`` mapping consumed by ``PandasDataBacktesting``.
-
-    Symbols are de-duplicated, classified as stock vs crypto via
-    ``params.CRYPTO_SYMBOLS``, and skipped (with a warning) when their CSV
-    is missing or empty.
-
-    Crypto assets are registered against ``QUOTE_ASSET``. The strategy has
-    to request history with the same asset and quote or the lookup misses.
-    """
-    symbols = list(
-        dict.fromkeys(P.STOCK_SLEEVE_SYMBOLS + P.CRYPTO_SLEEVE_SYMBOLS + [P.STOCK_BENCH, P.CRYPTO_BENCH])
-    )
+def _load_pandas_data():
+    symbols = list(dict.fromkeys(P.STOCK_SLEEVE_SYMBOLS + [P.STOCK_BENCH]))
     pandas_data: dict[Asset, Data] = {}
     starts: list[pd.Timestamp] = []
     ends: list[pd.Timestamp] = []
     missing_symbols: list[str] = []
-    stock_quote = Asset(symbol="USD", asset_type=Asset.AssetType.FOREX)
 
     for symbol in symbols:
-        filename = f"{_normalize_symbol(symbol)}_1m_spot.csv"
+        filename = f"{_normalize_symbol(symbol)}_daily.csv"
         path = DATA_DIR / filename
         if not path.exists():
             print(f"[WARN] Missing CSV for {symbol}: {path}")
@@ -210,13 +157,8 @@ def _load_pandas_data() -> tuple[dict[Asset, Data], list[pd.Timestamp], list[pd.
             print(f"[WARN] Empty CSV for {symbol}: {path}")
             continue
 
-        is_crypto = symbol in P.CRYPTO_SYMBOLS
-        asset = Asset(
-            symbol=symbol,
-            asset_type=Asset.AssetType.CRYPTO if is_crypto else Asset.AssetType.STOCK,
-        )
-        quote = QUOTE_ASSET if is_crypto else stock_quote
-        pandas_data[asset] = Data(asset, df, timestep="minute", quote=quote)
+        asset = Asset(symbol=symbol, asset_type=Asset.AssetType.STOCK)
+        pandas_data[asset] = Data(asset, df, timestep="day", quote=QUOTE_ASSET)
         starts.append(df.index.min())
         ends.append(df.index.max())
 
@@ -224,11 +166,6 @@ def _load_pandas_data() -> tuple[dict[Asset, Data], list[pd.Timestamp], list[pd.
 
 
 def run_backtest() -> None:
-    """
-    Run the Pandas / CSV backtest against ``strategies.strategy.Strategy``.
-
-    Docs: https://lumibot.lumiwealth.com/backtesting.pandas.html
-    """
     if not DATA_DIR.exists():
         raise RuntimeError(f"Data directory not found: {DATA_DIR}")
 
@@ -239,8 +176,6 @@ def run_backtest() -> None:
         missing = ", ".join(sorted(missing_symbols))
         raise RuntimeError(f"Missing CSV files for required symbols: {missing}")
 
-    # Clamp the backtest window to the intersection of every symbol's data
-    # range so Lumibot never tries to step past the end of any series.
     backtesting_start = max(starts).to_pydatetime()
     backtesting_end = min(ends).to_pydatetime()
     if BACKTEST_START is not None:
@@ -260,12 +195,6 @@ def run_backtest() -> None:
         f"[INFO] Backtest window: {backtesting_start} -> {backtesting_end} "
         f"({span_days} days)"
     )
-    if span_days < Strategy.SLOW_SMA_DAYS + 1:
-        print(
-            f"[WARN] The window is shorter than the {Strategy.SLOW_SMA_DAYS}-day "
-            f"slow SMA needs, so no entry signal can form and the run will "
-            f"produce no trades. Widen the data or clear BACKTEST_START/END."
-        )
 
     Strategy.run_backtest(
         PandasDataBacktesting,
