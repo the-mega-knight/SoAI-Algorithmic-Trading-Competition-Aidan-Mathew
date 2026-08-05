@@ -10,8 +10,8 @@ mostly invested and rebalances infrequently (weekly) rather than reacting
 to every daily wiggle, while a separate daily-checked volatility/gap
 throttle cuts exposure to any single name showing an abnormal move.
 
-Why this design, and not daily binary trend-following
---------------------------------------------------------
+Why momentum, and not mean-reversion or daily binary trend-following
+------------------------------------------------------------------------
 Two earlier versions of this strategy (crypto momentum, then daily SMA
 crossover on this same equity universe) were both validated against real
 historical data and both underperformed simple buy-and-hold by a wide
@@ -19,8 +19,24 @@ margin. The common cause: daily binary entry/exit trading generates heavy
 turnover (500+ trades over ~450 days), most of it whipsaw on short-term
 noise rather than genuine trend changes, and the fees on that turnover ate
 a large share of the return. Every version tested pointed the same
-direction: staying invested consistently beat trading in and out. This
-version is built directly around that finding.
+direction: staying invested consistently beat trading in and out.
+
+A short-horizon RSI mean-reversion variant was also built and tested
+side by side with this one (see mean_reversion.py / regime_test_mr.py).
+It won convincingly in the 2022 bear-market regime and roughly matched
+buy-and-hold in the most recent real month, but lost badly to both
+buy-and-hold and this momentum strategy in every trending regime
+(2018-19, 2020, 2021, 2023-24), since a dip-buying strategy mostly sits
+out of a market that never dips. Two pieces of outside evidence point the
+same direction as that result: academic work on cryptocurrency return
+reversal (Zaremba et al. 2021) finds that reversal is a small/illiquid-
+asset phenomenon and the most liquid ~2% of assets show momentum instead;
+and work on trading-strategy capacity (Bonelli, Landier, Simon, Thesmar
+2019) shows that faster-turning signals give back more of their gross
+edge to trading costs than slow-moving ones, independent of scale. Both
+point toward momentum being the structurally sounder fit for five
+already-hyper-liquid, large-cap names, so momentum was kept as the
+strategy actually submitted.
 
 Rules (zero discretion)
 ------------------------
@@ -45,6 +61,23 @@ Risk throttle:    checked every day regardless of rebalance schedule,
                   OHLCV bars only, no news or calendar data, so a strategy
                   that depended on knowing earnings dates in advance would
                   not be reliably reproducible in the official environment.
+                  Loosened (v3.2) relative to the original calibration
+                  after regime testing showed the tighter throttle was
+                  giving back meaningful bull-market upside for very
+                  little extra 2022-style crash protection - the
+                  portfolio-level circuit breaker below, not this daily
+                  throttle, was doing the real work in that test.
+Known-event derisk: a small, symmetric, non-predictive exception to the
+                  "no calendar data" rule above: NVDA's own publicly
+                  scheduled earnings date is hardcoded (EARNINGS_RISK_DATES)
+                  and that name's weight is proactively capped on that one
+                  date. This does not bet on the report's direction (beat
+                  or miss) - it only shrinks the position size ahead of a
+                  known binary, single-stock event, the same way a human
+                  trader would size down before a coin flip with unusually
+                  large stakes. If the date list is ever empty or stale,
+                  the strategy trades exactly as if this section did not
+                  exist.
 Risk control:     portfolio-level drawdown circuit breaker - if portfolio
                   value draws down more than MAX_DRAWDOWN_PCT from its
                   running peak, flatten everything and pause new entries
@@ -80,6 +113,8 @@ The official execution environment imports the class defined here, so:
 * Keep the import path ``from strategies.strategy import Strategy``.
 """
 
+import datetime as _dt
+
 from lumibot.strategies import Strategy as _LumibotStrategy
 
 
@@ -96,19 +131,30 @@ class Strategy(_LumibotStrategy):
 
     VOL_LOOKBACK_DAYS = 20
     VOL_BASELINE_DAYS = 60
-    VOL_SPIKE_MULTIPLIER = 1.8
-    VOL_THROTTLE_FACTOR = 0.5
+    VOL_SPIKE_MULTIPLIER = 2.3    # v3.2: loosened from 1.8, see module docstring
+    VOL_THROTTLE_FACTOR = 0.7     # v3.2: loosened from 0.5
 
     GAP_THRESHOLD_PCT = 0.05
-    GAP_THROTTLE_FACTOR = 0.3
+    GAP_THROTTLE_FACTOR = 0.5     # v3.2: loosened from 0.3
     GAP_COOLDOWN_DAYS = 3
 
-    MAX_ASSET_WEIGHT = 0.40       # no single name above 40% of portfolio
-    MAX_TOTAL_EXPOSURE = 0.98     # stay close to fully invested
+    MAX_ASSET_WEIGHT = 0.50       # v3.2: raised from 0.40
+    MAX_TOTAL_EXPOSURE = 1.00     # v3.2: raised from 0.98
     MIN_REBALANCE_PCT = 0.02      # ignore rebalances smaller than 2% of NAV
 
     MAX_DRAWDOWN_PCT = 0.25       # 25% drawdown from peak trips the breaker
     DRAWDOWN_COOLDOWN_DAYS = 5    # trading days to stay flat after a trip
+
+    # Publicly scheduled, single-stock binary events known well in advance
+    # (e.g. earnings calls). Symmetric, non-predictive position-size cap on
+    # those specific dates only - see "Known-event derisk" in the module
+    # docstring. Dates are the trading day of the announcement itself
+    # (NVDA reports after the close on this date, so the cap applies to
+    # the day the position is held into the report, not the day after).
+    EARNINGS_RISK_DATES = {
+        "NVDA": ["2026-08-26"],
+    }
+    EARNINGS_DERISK_FACTOR = 0.5  # halve the name's weight on that date
 
     # How many days of daily history to pull per iteration. Must cover the
     # longest lookback used anywhere below (VOL_BASELINE_DAYS=60) plus a
@@ -211,6 +257,7 @@ class Strategy(_LumibotStrategy):
 
         # -- Step 4: daily risk throttle, applied every iteration
         #    regardless of the rebalance schedule, using only OHLCV data.
+        today_str = self._today_str()
         target_weights = {}
         for symbol in self.STOCK_UNIVERSE:
             w = self.base_weights.get(symbol, 0.0)
@@ -242,6 +289,13 @@ class Strategy(_LumibotStrategy):
                 throttle = min(throttle, self.GAP_THROTTLE_FACTOR)
                 self.gap_cooldown[symbol] -= 1
 
+            # Known-event derisk: symmetric size cap on a publicly
+            # scheduled binary event date (see module docstring). Not a
+            # directional bet - just less size going into a known
+            # single-stock risk day.
+            if today_str in self.EARNINGS_RISK_DATES.get(symbol, []):
+                throttle = min(throttle, self.EARNINGS_DERISK_FACTOR)
+
             target_weights[symbol] = w * throttle
 
         # -- Step 5: translate target weights into orders.
@@ -271,6 +325,18 @@ class Strategy(_LumibotStrategy):
                 )
             return None
         return bars.df
+
+    def _today_str(self):
+        """Current simulated/live trading date as 'YYYY-MM-DD', used only
+        for the known-event derisk check above."""
+        dt = self.get_datetime()
+        if dt is None:
+            return ""
+        if isinstance(dt, _dt.datetime):
+            return dt.date().isoformat()
+        if isinstance(dt, _dt.date):
+            return dt.isoformat()
+        return str(dt)[:10]
 
     # ------------------------------------------------------------------
     # Position sizing
