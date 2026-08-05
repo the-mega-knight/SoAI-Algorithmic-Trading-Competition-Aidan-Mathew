@@ -3,17 +3,14 @@ Independent vectorized re-implementation of the strategy's decision rules,
 used to validate + stress-test the logic (per trading-backtest-methodology)
 without depending on a full Lumibot install in this sandbox.
 
-v2 changes from the original momentum strategy, per the underperformance-vs-
-buy-and-hold diagnosis:
-  - Added a 100-day regime filter: only enter when price is above its own
-    100-day SMA, to avoid trading noise in non-trending stretches.
-  - Added a 2-day exit confirmation: a single-day trend break no longer
-    flattens the position immediately, cutting whipsaw round-trips.
-  - Switched sizing from inverse-volatility to momentum-weighted (weight
-    proportional to recent ROC), so strong trends get more capital instead
-    of being penalized for their own volatility.
-  - Raised MAX_ASSET_WEIGHT and MAX_TOTAL_EXPOSURE since the two filters
-    above should reduce the need for such conservative caps.
+v3: low-turnover momentum core + OHLCV-only volatility/gap risk throttle.
+See the commit message / README for the full reasoning. In short: v1
+(daily binary trend-following on crypto) and v2 (daily binary trend-
+following on stocks, then a first attempt at reducing turnover) both lost
+to simple buy-and-hold on real data. This version is built directly around
+that finding - stay close to fully invested, rebalance infrequently, and
+use volatility/gap spikes (not a forbidden external calendar) as the sole
+risk-reduction trigger between rebalances.
 """
 import numpy as np
 import pandas as pd
@@ -24,11 +21,27 @@ import json
 DATA_DIR = Path(__file__).resolve().parent / "data"
 UNIVERSE = ["AAPL", "MSFT", "GOOGL", "AMZN", "NVDA"]
 
+# Fixed regardless of parameters, so every sensitivity run evaluates the
+# exact same slice of days. Must exceed the largest lookback used anywhere
+# in DEFAULT_PARAMS or the grid/sensitivity sweeps below (vol_baseline_days
+# = 60 is the largest).
+WARMUP_DAYS = 65
+
 DEFAULT_PARAMS = dict(
-    fast=15, slow=25, mom=10, vol_lookback=20, regime_days=100,
-    exit_confirm_days=2,
-    max_asset_weight=0.65, max_total_exposure=0.98,
-    min_rebalance_pct=0.02, max_drawdown_pct=0.25, cooldown_days=5,
+    mom_lookback=20,
+    rebalance_every=5,
+    vol_lookback=20,
+    vol_baseline_days=60,
+    vol_spike_multiplier=1.8,
+    vol_throttle_factor=0.5,
+    gap_threshold_pct=0.05,
+    gap_throttle_factor=0.3,
+    gap_cooldown_days=3,
+    max_asset_weight=0.40,
+    max_total_exposure=0.98,
+    min_rebalance_pct=0.02,
+    max_drawdown_pct=0.25,
+    cooldown_days=5,
     fee_bps=2.0,  # matches the official 2bps fee stated on the competition site
 )
 
@@ -39,14 +52,13 @@ def load_daily(symbol):
     return df[["open", "high", "low", "close", "volume"]]
 
 
-def momentum_weights(qualifying_roc, max_asset_weight, max_total_exposure):
-    if not qualifying_roc:
+def momentum_weights(pos_roc, max_asset_weight, max_total_exposure):
+    if not pos_roc:
         return {}
-    scores = {s: max(v, 1e-6) for s, v in qualifying_roc.items()}
-    total = sum(scores.values())
+    total = sum(pos_roc.values())
     if total <= 0:
         return {}
-    weights = {s: sc / total for s, sc in scores.items()}
+    weights = {s: v / total for s, v in pos_roc.items()}
     for _ in range(len(weights) + 1):
         over = {s: w for s, w in weights.items() if w > max_asset_weight}
         if not over:
@@ -71,49 +83,50 @@ def run_backtest(params, start_cash=1_000_000, verbose=False):
         common_index = idx if common_index is None else common_index.intersection(idx)
     common_index = common_index.sort_values()
 
-    fast, slow, mom = params["fast"], params["slow"], params["mom"]
-    vol_lb, regime_days = params["vol_lookback"], params["regime_days"]
+    mom_lb = params["mom_lookback"]
+    vol_lb, vol_base_days = params["vol_lookback"], params["vol_baseline_days"]
 
     sig = {}
     for s in UNIVERSE:
+        open_ = daily[s]["open"].reindex(common_index)
         close = daily[s]["close"].reindex(common_index)
-        sma_fast = close.rolling(fast).mean()
-        sma_slow = close.rolling(slow).mean()
-        sma_regime = close.rolling(regime_days).mean()
-        roc = close.pct_change(periods=mom)
+        roc = close.pct_change(periods=mom_lb)
         daily_ret = close.pct_change()
-        vol = daily_ret.rolling(vol_lb).std()
-
-        entry_raw = (sma_fast > sma_slow) & (roc > 0) & (close > sma_regime)
-        exit_raw = (sma_fast <= sma_slow)
+        vol_short = daily_ret.rolling(vol_lb).std()
+        vol_baseline = daily_ret.rolling(vol_base_days).std()
+        vol_spike_ratio = vol_short / vol_baseline.replace(0, np.nan)
+        gap_pct = (open_ - close.shift(1)) / close.shift(1)
 
         sig[s] = pd.DataFrame({
-            "close": close, "entry_raw": entry_raw, "exit_raw": exit_raw,
-            "roc": roc, "vol": vol,
+            "close": close, "roc": roc,
+            "vol_spike_ratio": vol_spike_ratio, "gap_pct": gap_pct,
         })
 
     cash = start_cash
     qty = {s: 0.0 for s in UNIVERSE}
-    in_position = {s: False for s in UNIVERSE}
-    exit_streak = {s: 0 for s in UNIVERSE}
     equity_curve = []
     peak = start_cash
     cooldown = 0
     trade_count = 0
     fee_rate = params["fee_bps"] / 10_000.0
 
-    warmup = max(fast, slow, mom, vol_lb, regime_days) + 1
-    dates = common_index[warmup:]
+    base_weights = {}
+    gap_cooldown = {s: 0 for s in UNIVERSE}
+    day_index = 0
+    force_rebalance = True
+
+    dates = common_index[WARMUP_DAYS:]
 
     def _flatten_and_reset():
-        nonlocal cash, trade_count
+        nonlocal cash, trade_count, base_weights, force_rebalance
         for s in UNIVERSE:
             if qty[s] > 0:
                 cash += qty[s] * prices[s] * (1 - fee_rate)
                 trade_count += 1
                 qty[s] = 0.0
-            in_position[s] = False
-            exit_streak[s] = 0
+            gap_cooldown[s] = 0
+        base_weights = {}
+        force_rebalance = True
 
     for dt in dates:
         prices = {s: sig[s].loc[dt, "close"] for s in UNIVERSE}
@@ -134,32 +147,39 @@ def run_backtest(params, start_cash=1_000_000, verbose=False):
             equity_curve.append((dt, cash))
             continue
 
-        # -- hysteresis: update in_position / exit_streak per asset
-        for s in UNIVERSE:
-            row = sig[s].loc[dt]
-            if pd.isna(row["entry_raw"]) or pd.isna(row["exit_raw"]):
-                continue  # not enough history yet for this asset
-            if not in_position[s]:
-                if bool(row["entry_raw"]):
-                    in_position[s] = True
-                    exit_streak[s] = 0
-            else:
-                if bool(row["exit_raw"]):
-                    exit_streak[s] += 1
-                else:
-                    exit_streak[s] = 0
-                if exit_streak[s] >= params["exit_confirm_days"]:
-                    in_position[s] = False
-                    exit_streak[s] = 0
+        # -- rebalance schedule: recompute target composition only every
+        #    N trading days (or immediately after a breaker reset)
+        if force_rebalance or (day_index % params["rebalance_every"] == 0):
+            pos_roc = {
+                s: sig[s].loc[dt, "roc"] for s in UNIVERSE
+                if sig[s].loc[dt, "roc"] == sig[s].loc[dt, "roc"] and sig[s].loc[dt, "roc"] > 0
+            }
+            base_weights = momentum_weights(pos_roc, params["max_asset_weight"], params["max_total_exposure"])
+            force_rebalance = False
+        day_index += 1
 
-        qualifying_roc = {
-            s: sig[s].loc[dt, "roc"] for s in UNIVERSE
-            if in_position[s] and sig[s].loc[dt, "roc"] == sig[s].loc[dt, "roc"]
-        }
-        weights = momentum_weights(qualifying_roc, params["max_asset_weight"], params["max_total_exposure"])
+        # -- daily risk throttle: applied every day regardless of rebalance
+        #    schedule, using only OHLCV-derived signals (vol spike, gap)
+        target_weights = {}
+        for s in UNIVERSE:
+            w = base_weights.get(s, 0.0)
+            if w <= 0:
+                target_weights[s] = 0.0
+                continue
+            throttle = 1.0
+            spike = sig[s].loc[dt, "vol_spike_ratio"]
+            if spike == spike and spike > params["vol_spike_multiplier"]:
+                throttle = min(throttle, params["vol_throttle_factor"])
+            gap = sig[s].loc[dt, "gap_pct"]
+            if gap == gap and abs(gap) > params["gap_threshold_pct"]:
+                gap_cooldown[s] = params["gap_cooldown_days"]
+            if gap_cooldown[s] > 0:
+                throttle = min(throttle, params["gap_throttle_factor"])
+                gap_cooldown[s] -= 1
+            target_weights[s] = w * throttle
 
         for s in UNIVERSE:
-            target_w = weights.get(s, 0.0)
+            target_w = target_weights.get(s, 0.0)
             price = prices[s]
             current_value = qty[s] * price
             target_value = target_w * port_value
@@ -221,36 +241,34 @@ def run_backtest(params, start_cash=1_000_000, verbose=False):
 
 
 if __name__ == "__main__":
-    print("=== Baseline run (v2: regime filter + exit confirm + momentum weighting) ===")
+    print("=== Baseline run (v3: weekly momentum core + vol/gap throttle) ===")
     result, ec = run_backtest(DEFAULT_PARAMS, verbose=True)
 
-    print("\n=== Parameter sensitivity grid (fast/slow SMA, tighter band around 15/25) ===")
+    print("\n=== Grid: mom_lookback x rebalance_every ===")
     grid_results = []
-    for fast, slow in itertools.product([10, 12, 13, 14, 15, 16, 17, 18, 20], [20, 22, 24, 25, 26, 28, 30, 32, 35]):
-        if fast >= slow:
-            continue
+    for mom_lb, rebal in itertools.product([10, 15, 20, 25, 30], [3, 5, 10, 15]):
         p = dict(DEFAULT_PARAMS)
-        p["fast"], p["slow"] = fast, slow
+        p["mom_lookback"], p["rebalance_every"] = mom_lb, rebal
         r, _ = run_backtest(p)
-        grid_results.append({"fast": fast, "slow": slow, **r})
+        grid_results.append({"mom_lookback": mom_lb, "rebalance_every": rebal, **r})
 
     grid_df = pd.DataFrame(grid_results).sort_values("sharpe", ascending=False)
     pd.set_option("display.width", 120)
     print(grid_df.to_string(index=False))
 
-    print("\n=== Sensitivity: exit_confirm_days (1, 2, 3) ===")
-    for d in [1, 2, 3]:
+    print("\n=== Sensitivity: vol_spike_multiplier (1.5, 1.8, 2.2) ===")
+    for m in [1.5, 1.8, 2.2]:
         p = dict(DEFAULT_PARAMS)
-        p["exit_confirm_days"] = d
+        p["vol_spike_multiplier"] = m
         r, _ = run_backtest(p)
-        print(f"exit_confirm_days={d}: {json.dumps(r)}")
+        print(f"vol_spike_multiplier={m}: {json.dumps(r)}")
 
-    print("\n=== Sensitivity: regime_days (50, 100, 150) ===")
-    for d in [50, 100, 150]:
+    print("\n=== Sensitivity: gap_threshold_pct (0.03, 0.05, 0.08) ===")
+    for g in [0.03, 0.05, 0.08]:
         p = dict(DEFAULT_PARAMS)
-        p["regime_days"] = d
+        p["gap_threshold_pct"] = g
         r, _ = run_backtest(p)
-        print(f"regime_days={d}: {json.dumps(r)}")
+        print(f"gap_threshold_pct={g}: {json.dumps(r)}")
 
     print("\n=== Stress test: 2x slippage/fee ===")
     p_stress = dict(DEFAULT_PARAMS)
