@@ -165,6 +165,92 @@ def _load_pandas_data():
     return pandas_data, starts, ends, missing_symbols
 
 
+def _bench_total_return(pandas_data: dict, start, end) -> float | None:
+    """Buy-and-hold total return of the BENCH5 composite over [start, end],
+    computed straight from the local CSV we already loaded - no network
+    calls. Returns None if BENCH5 wasn't loaded."""
+    bench_asset = Asset(symbol=P.STOCK_BENCH, asset_type=Asset.AssetType.STOCK)
+    data_obj = pandas_data.get(bench_asset)
+    if data_obj is None:
+        return None
+    df = data_obj.df
+    window = df.loc[(df.index >= start) & (df.index <= end)]
+    if window.empty:
+        window = df
+    first_close = float(window["close"].iloc[0])
+    last_close = float(window["close"].iloc[-1])
+    if first_close <= 0:
+        return None
+    return (last_close / first_close) - 1.0
+
+
+def _print_terminal_summary(analysis, strat, pandas_data, backtesting_start, backtesting_end) -> None:
+    """Print a clean, always-visible results summary to the terminal.
+
+    Historically the only way to see results was to open the generated
+    tearsheet HTML - backtest.py only ever logged per-iteration trade
+    fills to the terminal. This prints the headline numbers directly,
+    computed from data we already have locally (no Yahoo/network calls,
+    which is what was silently breaking the tearsheet's own benchmark
+    comparison for the synthetic BENCH5 symbol - see benchmark_asset=None
+    below).
+    """
+    print("\n" + "=" * 60)
+    print("RESULTS SUMMARY")
+    print("=" * 60)
+
+    span_days = (backtesting_end - backtesting_start).days
+    years = span_days / 365.25 if span_days > 0 else 0.0
+
+    initial_budget = getattr(strat, "initial_budget", BUDGET)
+    final_value = None
+    try:
+        final_value = strat.get_portfolio_value()
+    except Exception:
+        pass
+
+    if final_value is not None and initial_budget:
+        total_return = (final_value / initial_budget) - 1.0
+        print(f"Initial budget:     ${initial_budget:,.2f}")
+        print(f"Final portfolio:    ${final_value:,.2f}")
+        print(f"Total return:       {total_return:+.2%}")
+        if years > 0:
+            cagr = (final_value / initial_budget) ** (1 / years) - 1
+            print(f"CAGR:               {cagr:+.2%}  (over {years:.2f} years)")
+    else:
+        print("[WARN] Could not read final portfolio value from the strategy object.")
+
+    bench_return = _bench_total_return(pandas_data, backtesting_start, backtesting_end)
+    if bench_return is not None:
+        print(f"BENCH5 buy&hold:    {bench_return:+.2%}  (5-stock equal-weight composite)")
+    else:
+        print("[WARN] BENCH5 not found in pandas_data - run scripts/build_benchmark.py first.")
+
+    # Pull the daily Portfolio Value / Drawdown % lines we log via
+    # add_line() in strategy.py for a max-drawdown and rough Sharpe figure,
+    # entirely from local data collected during the run.
+    try:
+        lines_df = strat.get_lines_df()
+        if lines_df is not None and not lines_df.empty:
+            dd_col = next((c for c in lines_df.columns if "Drawdown" in str(c)), None)
+            if dd_col is not None:
+                max_dd = lines_df[dd_col].min()
+                print(f"Max drawdown:       {max_dd:.2f}%  (from logged Drawdown % line)")
+            pv_col = next((c for c in lines_df.columns if "Portfolio Value" in str(c)), None)
+            if pv_col is not None:
+                daily_returns = lines_df[pv_col].pct_change().dropna()
+                if len(daily_returns) > 1 and daily_returns.std() > 0:
+                    sharpe = (daily_returns.mean() / daily_returns.std()) * (252 ** 0.5)
+                    print(f"Sharpe (approx):    {sharpe:.2f}  (annualized from daily Portfolio Value line)")
+    except Exception as exc:
+        print(f"[INFO] Skipped lines-based stats (get_lines_df unavailable or unexpected shape): {exc}")
+
+    print("=" * 60)
+    print("Full tearsheet, trades, and indicator charts are in logs/ - ")
+    print("this terminal summary is a quick check, not a replacement for them.")
+    print("=" * 60 + "\n")
+
+
 def run_backtest() -> None:
     if not DATA_DIR.exists():
         raise RuntimeError(f"Data directory not found: {DATA_DIR}")
@@ -196,17 +282,28 @@ def run_backtest() -> None:
         f"({span_days} days)"
     )
 
-    Strategy.run_backtest(
+    # benchmark_asset is intentionally None, not P.STOCK_BENCH. Lumibot's
+    # built-in tearsheet benchmark comparison fetches the benchmark's
+    # returns via Yahoo Finance internally regardless of what's in
+    # pandas_data - fine for a real ticker like AAPL, but BENCH5 is a
+    # synthetic symbol that doesn't exist on Yahoo, so that fetch 404s
+    # ("possibly delisted; no timezone found") and silently degrades the
+    # tearsheet's benchmark rows/plot. We compute the BENCH5 comparison
+    # ourselves in _print_terminal_summary() from the local CSV instead,
+    # which is both correct and has no network dependency.
+    analysis, strat = Strategy.run_backtest(
         PandasDataBacktesting,
         backtesting_start,
         backtesting_end,
         pandas_data=pandas_data,
         budget=BUDGET,
         quote_asset=QUOTE_ASSET,
-        benchmark_asset=P.STOCK_BENCH,
+        benchmark_asset=None,
         quiet_logs=QUIET_LOGS,
         **_execution_cost_kwargs(),
     )
+
+    _print_terminal_summary(analysis, strat, pandas_data, backtesting_start, backtesting_end)
 
 
 if __name__ == "__main__":

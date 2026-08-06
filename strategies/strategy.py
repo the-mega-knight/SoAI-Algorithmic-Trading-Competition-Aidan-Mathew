@@ -306,10 +306,20 @@ class Strategy(_LumibotStrategy):
         #    chart. Lumibot leaves that chart empty unless add_line() is
         #    called during the run - this is purely observational and has
         #    zero effect on trading decisions or order sizing above.
-        self.add_line("Portfolio Value", portfolio_value)
-        self.add_line("Drawdown %", drawdown * 100)
+        #    Portfolio Value is dollars in the millions; drawdown/weights
+        #    are 0-100. Those were originally all on one implicit
+        #    "default_plot" and shared a y-axis, which visually flattened
+        #    the weight lines to zero next to the much larger portfolio
+        #    value line. Splitting them into two named plots via
+        #    plot_name= fixes that - each gets its own y-axis/subplot.
+        self.add_line("Portfolio Value", portfolio_value, plot_name="Portfolio Value ($)")
+        self.add_line("Drawdown %", drawdown * 100, plot_name="Drawdown & Weights (%)")
         for symbol in self.STOCK_UNIVERSE:
-            self.add_line(f"{symbol} Weight %", target_weights.get(symbol, 0.0) * 100)
+            self.add_line(
+                f"{symbol} Weight %",
+                target_weights.get(symbol, 0.0) * 100,
+                plot_name="Drawdown & Weights (%)",
+            )
 
         rounded = {s: round(w, 4) for s, w in sorted(target_weights.items())}
         if rounded != self._last_logged_weights:

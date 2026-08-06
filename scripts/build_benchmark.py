@@ -24,13 +24,24 @@ Usage
     python3 scripts/build_benchmark.py
     python3 backtest.py
 """
+import sys
 from pathlib import Path
+
+# Running this file directly (`python3 scripts/build_benchmark.py`) puts
+# only this file's own directory (scripts/) on sys.path, not the repo
+# root - so `from strategies.params import ...` below fails with
+# "ModuleNotFoundError: No module named 'strategies'" even when run from
+# the repo root. Explicitly add the repo root so the documented usage
+# above (`python3 scripts/build_benchmark.py`) actually works.
+_REPO_ROOT = Path(__file__).resolve().parent.parent
+if str(_REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(_REPO_ROOT))
 
 import pandas as pd
 
 from strategies.params import STOCK_SLEEVE_SYMBOLS
 
-DATA_DIR = Path(__file__).resolve().parent.parent / "data"
+DATA_DIR = _REPO_ROOT / "data"
 OUTPUT_SYMBOL = "BENCH5"
 
 
