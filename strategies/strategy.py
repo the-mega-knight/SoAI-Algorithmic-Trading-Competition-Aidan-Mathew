@@ -4,28 +4,38 @@ import numpy as np
 
 class Strategy(_LumibotStrategy):
     """
-    3-day cross-sectional momentum strategy (research implementation).
+RSI Filter Mean Reversion Strategy (research implementation).
 
-    - Wake once per day (self.sleeptime = "1D").
-    - Universe: BTC/USD, ETH/USD, SOL/USD, XRP/USD, DOGE/USD, LINK/USD, AVAX/USD, ADA/USD
-    - At each iteration, compute 3-day momentum for each symbol using only
-      completed historical daily closes:
+- Wake once per day (self.sleeptime = "1D").
+- Universe: BTC/USD, ETH/USD, SOL/USD, XRP/USD, DOGE/USD,
+  LINK/USD, AVAX/USD, ADA/USD.
+- At each iteration, retrieve completed historical daily closes for
+  each asset and compute:
+    - 14-day RSI using a simple moving average (SMA) of gains and losses.
+    - 3-day momentum:
 
         momentum = close[t-1] / close[t-4] - 1
 
-      where iloc[-1] is the most recently *completed* daily close returned by
-      the data API. If fewer than 4 completed daily closes are available for a
-      symbol it is excluded for that iteration.
+      where iloc[-1] is the most recently completed daily close returned
+      by the data API.
 
-    - Rank by momentum, pick top 2, allocate 50% / 50%.
-    - Rebalance to target weights; liquidate assets that drop out of the top 2.
+- Filter the universe to assets with RSI < 35.
+- Among the qualifying assets, select the two with the most negative
+  3-day momentum (largest recent declines).
+- Portfolio allocation:
+    - Two qualifying assets: 50% / 50%.
+    - One qualifying asset: 50% invested, 50% held in cash.
+    - No qualifying assets: remain 100% in cash.
+- Rebalance once per day and exit any position that no longer satisfies
+  the selection criteria.
 
-    Notes on timing and safety:
-    - The implementation intentionally reads only completed daily bars from
-      self.get_historical_prices(..., timestep="day") and references iloc[-1]
-      and iloc[-4] to avoid using the current day's intraday data.
-    - If fewer than 2 valid symbols are available the strategy no-ops.
-    """
+Notes on timing and safety:
+- The implementation intentionally uses only completed daily bars from
+  self.get_historical_prices(..., timestep="day") and references
+  iloc[-1] and iloc[-4] to avoid look-ahead bias.
+- Assets with insufficient historical data are skipped until enough
+  completed daily closes are available to compute RSI and momentum.
+"""
 
     def initialize(self):
         # Wake up once per trading day.
