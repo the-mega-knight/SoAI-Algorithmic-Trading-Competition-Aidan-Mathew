@@ -1,4 +1,5 @@
 from lumibot.strategies import Strategy as _LumibotStrategy
+import numpy as np
 
 
 class Strategy(_LumibotStrategy):
@@ -48,29 +49,47 @@ class Strategy(_LumibotStrategy):
 
         self.log_message("[strategy] 3-day momentum initialized")
 
+    def _rsi(self, series, window: int = 14):
+        """Simple RSI implementation matching research (SMA of gains/losses)."""
+        delta = series.diff()
+        gain = delta.clip(lower=0)
+        loss = -delta.clip(upper=0)
+        avg_gain = gain.rolling(window, min_periods=window).mean()
+        avg_loss = loss.rolling(window, min_periods=window).mean()
+        rs = avg_gain / avg_loss
+        rsi = 100 - (100 / (1 + rs))
+        return rsi
+
     def on_trading_iteration(self):
-        # Gather momentum signals
-        signals = []  # list of (symbol, momentum)
+        # RSI Filter Mean Reversion
+        # For each symbol compute:
+        #  - RSI(14) using completed daily closes (SMA of gains/losses)
+        #  - 3-day completed momentum: close[t-1] / close[t-4] - 1
+        # Select symbols with RSI < 35. From those, pick the two assets with the
+        # lowest 3-day momentum (most negative). Equal-weight 50/50. If fewer than
+        # two qualified assets, allocate as available. If none qualify, stay in cash.
+
+        signals = []  # list of (symbol, momentum, rsi)
 
         for symbol in self.symbols:
             try:
-                bars = self.get_historical_prices(symbol, length=5, timestep="day")
+                # Request enough history for RSI(14) + momentum (needs 4 closes)
+                bars = self.get_historical_prices(symbol, length=20, timestep="day")
             except Exception:
                 self.log_message(f"[warn] historical data call failed for {symbol}")
                 continue
 
             if bars is None or getattr(bars, "df", None) is None or bars.df.empty:
-                # No data available for this symbol in this iteration.
-                # Keep logging minimal.
                 continue
 
             close = bars.df.get("close")
-            if close is None or len(close.dropna()) < 4:
-                # Need at least 4 completed daily closes to compute close[t-1]/close[t-4]
+            if close is None:
                 continue
 
-            # Use iloc[-1] and iloc[-4] which refer to the most recently completed
-            # daily close and the close 3 trading days earlier respectively.
+            # Need sufficient history for RSI(14) and 3-day momentum (4 closes)
+            if len(close.dropna()) < 18:
+                continue
+
             try:
                 recent = float(close.iloc[-1])
                 prior = float(close.iloc[-4])
@@ -81,44 +100,52 @@ class Strategy(_LumibotStrategy):
                 continue
 
             momentum = recent / prior - 1.0
-            signals.append((symbol, momentum))
+            rsi_series = self._rsi(close, 14)
+            rsi_val = float(rsi_series.iloc[-1]) if not rsi_series.empty else None
 
-        # If not enough valid symbols, do nothing this iteration.
-        if len(signals) < self.max_holdings:
+            if rsi_val is None or np.isnan(rsi_val):
+                continue
+
+            signals.append((symbol, momentum, rsi_val))
+
+        # Filter by RSI < 35
+        qualified = [(s, m, r) for (s, m, r) in signals if r < 35]
+
+        if len(qualified) == 0:
+            # No trades; remain in cash
             return
 
-        # Rank by momentum descending and take top N
-        signals.sort(key=lambda x: x[1], reverse=True)
-        top_symbols = [s for s, _ in signals[: self.max_holdings]]
+        # Rank by momentum ascending (most negative first) and pick up to max_holdings
+        qualified.sort(key=lambda x: x[1])
+        picks = qualified[: self.max_holdings]
+        picked_symbols = [s for s, _, _ in picks]
 
-        # Build target weights (equal-weighted among top picks)
+        # Build target weights (equal-weighted among picks)
         target_weights = {s: 0.0 for s in self.symbols}
-        for s in top_symbols:
-            target_weights[s] = 1.0 / self.max_holdings
+        if len(picked_symbols) == 1:
+            # Match research: allocate only 50% to a single qualifying asset and keep 50% cash
+            target_weights[picked_symbols[0]] = 0.5
+        else:
+            for s in picked_symbols:
+                target_weights[s] = 1.0 / len(picked_symbols)
 
-        # Convert weights to dollar targets and submit minimal orders to move
-        # current holdings toward targets. Avoid creating zero-quantity orders.
+        # Convert weights to dollar targets and submit orders
         portfolio_value = float(self.get_portfolio_value())
 
-        # Build current position lookup
         qty_lookup = {}
         try:
             positions = self.get_positions() or []
             for p in positions:
-                # Position.symbol exists on Position objects
                 qty_lookup[getattr(p, "symbol", None)] = float(getattr(p, "quantity", 0.0))
         except Exception:
             positions = []
 
-        # For every symbol in universe, compute desired quantity and submit diff order
         for symbol in self.symbols:
             target_w = float(target_weights.get(symbol, 0.0))
-            # If portfolio_value is zero or invalid, skip trading to avoid division errors
             if portfolio_value is None or portfolio_value <= 0:
                 return
 
             price = self.get_last_price(symbol)
-            # If price unavailable, skip trading this symbol
             if price is None or price <= 0:
                 continue
 
@@ -128,18 +155,14 @@ class Strategy(_LumibotStrategy):
             current_qty = float(qty_lookup.get(symbol, 0.0))
             diff = desired_qty - current_qty
 
-            # Avoid tiny micro trades; require a minimal quantity magnitude
             if abs(diff) < 1e-8:
                 continue
 
             if diff > 0:
-                # Buy the difference
                 order = self.create_order(symbol, diff, "buy")
                 self.submit_order(order)
             else:
-                # Sell the excess
                 order = self.create_order(symbol, abs(diff), "sell")
                 self.submit_order(order)
 
-        # Done for this iteration
         return

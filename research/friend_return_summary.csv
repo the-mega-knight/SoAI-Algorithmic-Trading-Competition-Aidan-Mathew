@@ -1,0 +1,2 @@
+strategy,start_value,final_value,total_return,sharpe,max_drawdown,annualized_volatility,average_turnover,positive_days,negative_days
+momentum_3d,100000.0,108691.66519481034,0.0869166519481033,2.194264754815873,-0.0954951782493876,0.3455481570275989,0.3,17,10

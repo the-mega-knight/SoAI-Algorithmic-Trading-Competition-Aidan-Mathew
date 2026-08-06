@@ -1,5 +1,5 @@
-lumibot==4.5.82
-pandas==2.3.3
-numpy==2.4.6
-yfinance==1.5.2
-python-dotenv==1.2.2
+lumibot
+python-dotenv
+pandas
+numpy
+scikit-learn
