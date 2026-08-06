@@ -18,8 +18,13 @@ STOCK_SLEEVE_SYMBOLS: list[str] = ["AAPL", "MSFT", "GOOGL", "AMZN", "NVDA"]
 CRYPTO_SLEEVE_SYMBOLS: list[str] = []
 
 # Benchmark symbol used by Lumibot to render the comparison line on the
-# generated tearsheet HTML.
-STOCK_BENCH: str = "AAPL"
+# generated tearsheet HTML. BENCH5 is a synthetic equal-weight, daily
+# rebalanced composite of the 5 sleeve symbols above (see
+# scripts/build_benchmark.py) - a single-AAPL benchmark isn't a fair
+# comparison since AAPL is just one of the five names we actually hold.
+# Run `python3 scripts/build_benchmark.py` (after fetch_stock_data.py) to
+# generate data/BENCH5_daily.csv before running backtest.py.
+STOCK_BENCH: str = "BENCH5"
 CRYPTO_BENCH: str = "AAPL"
 
 # Derived set used by ``backtest.py``. Empty here since there's no crypto
