@@ -302,6 +302,15 @@ class Strategy(_LumibotStrategy):
         for symbol in self.STOCK_UNIVERSE:
             self._rebalance_to_weight(symbol, target_weights.get(symbol, 0.0), portfolio_value)
 
+        # -- Step 6: indicator logging for the tearsheet's "indicators"
+        #    chart. Lumibot leaves that chart empty unless add_line() is
+        #    called during the run - this is purely observational and has
+        #    zero effect on trading decisions or order sizing above.
+        self.add_line("Portfolio Value", portfolio_value)
+        self.add_line("Drawdown %", drawdown * 100)
+        for symbol in self.STOCK_UNIVERSE:
+            self.add_line(f"{symbol} Weight %", target_weights.get(symbol, 0.0) * 100)
+
         rounded = {s: round(w, 4) for s, w in sorted(target_weights.items())}
         if rounded != self._last_logged_weights:
             self._last_logged_weights = rounded
