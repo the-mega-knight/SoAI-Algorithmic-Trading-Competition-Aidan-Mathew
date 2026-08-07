@@ -86,6 +86,16 @@ Risk control:     portfolio-level drawdown circuit breaker - if portfolio
                   the pre-crash high, so the breaker can't permanently
                   lock the strategy out of the market after a single
                   drawdown (a bug caught and fixed during validation).
+                  v4 (short-hedge variant): instead of just flattening to
+                  cash, the breaker also opens a short position in
+                  HEDGE_SYMBOL (SPY) sized at HEDGE_WEIGHT of portfolio
+                  value, held for the length of the cooldown, then
+                  covered when the cooldown ends and the peak resets.
+                  This only fires under the same rare drawdown condition
+                  as before (it has not fired in any validation run to
+                  date - closest approach was -22.5%) so it does not
+                  change day-to-day long-only behavior, only what happens
+                  in the tail case.
 Rebalance rule:   only trade a name when its target position differs from
                   the current one by more than MIN_REBALANCE_PCT of
                   portfolio value, to avoid churning on noise
@@ -145,6 +155,15 @@ class Strategy(_LumibotStrategy):
     MAX_DRAWDOWN_PCT = 0.25       # 25% drawdown from peak trips the breaker
     DRAWDOWN_COOLDOWN_DAYS = 5    # trading days to stay flat after a trip
 
+    # Short-hedge variant: when the breaker trips, short a market proxy
+    # instead of just going to cash, sized as a fraction of portfolio
+    # value. Symmetric with the long side's exposure cap in spirit, but
+    # deliberately smaller (0.5x) since this is a defensive hedge, not a
+    # second momentum book - see trading-position-sizer guidance on not
+    # over-sizing a tail-risk position relative to its conviction.
+    HEDGE_SYMBOL = "SPY"
+    HEDGE_WEIGHT = 0.50
+
     # Publicly scheduled, single-stock binary events known well in advance
     # (e.g. earnings calls). Symmetric, non-predictive position-size cap on
     # those specific dates only - see "Known-event derisk" in the module
@@ -174,6 +193,7 @@ class Strategy(_LumibotStrategy):
 
         self.peak_portfolio_value = None
         self.cooldown_days_left = 0
+        self.hedge_active = False
 
         self.base_weights = {}
         self.gap_cooldown = {s: 0 for s in self.STOCK_UNIVERSE}
@@ -216,6 +236,7 @@ class Strategy(_LumibotStrategy):
                 # during validation: this bug locked an earlier version
                 # out of the market for good after its first real drawdown.
                 self.peak_portfolio_value = portfolio_value
+                self._close_hedge()
             self.log_message(
                 f"[cooldown] {self.cooldown_days_left} day(s) left. "
                 f"portfolio=${portfolio_value:,.2f} drawdown={drawdown:.1%}"
@@ -224,10 +245,12 @@ class Strategy(_LumibotStrategy):
 
         if drawdown <= -self.MAX_DRAWDOWN_PCT:
             self._flatten_and_reset()
+            self._open_hedge(portfolio_value)
             self.cooldown_days_left = self.DRAWDOWN_COOLDOWN_DAYS
             self.log_message(
                 f"[circuit-breaker] drawdown {drawdown:.1%} breached "
-                f"-{self.MAX_DRAWDOWN_PCT:.0%} limit. Flattened and entering "
+                f"-{self.MAX_DRAWDOWN_PCT:.0%} limit. Flattened, opened "
+                f"{self.HEDGE_SYMBOL} short hedge, and entering "
                 f"{self.DRAWDOWN_COOLDOWN_DAYS}-day cooldown."
             )
             return
@@ -445,3 +468,45 @@ class Strategy(_LumibotStrategy):
             self.gap_cooldown[symbol] = 0
         self.base_weights = {}
         self.force_rebalance = True
+
+    # ------------------------------------------------------------------
+    # Circuit-breaker hedge (short-hedge variant)
+    # ------------------------------------------------------------------
+    def _open_hedge(self, portfolio_value):
+        """Open a short HEDGE_SYMBOL position sized at HEDGE_WEIGHT of
+        portfolio value, in place of just sitting in cash while the
+        breaker's cooldown runs. Only ever called right after
+        _flatten_and_reset(), so there is no existing long position in
+        HEDGE_SYMBOL to net against."""
+        if self.hedge_active:
+            return
+        price = self.get_last_price(self.HEDGE_SYMBOL)
+        if price is None or price <= 0:
+            self.log_message(
+                f"[hedge] no tradable price for {self.HEDGE_SYMBOL}, skipping hedge open."
+            )
+            return
+        target_value = self.HEDGE_WEIGHT * portfolio_value
+        qty = target_value / price
+        if qty <= 0:
+            return
+        order = self.create_order(self.HEDGE_SYMBOL, qty, "sell_short")
+        self.submit_order(order)
+        self.hedge_active = True
+        self.log_message(
+            f"[hedge] opened short {self.HEDGE_SYMBOL} qty={qty:.2f} "
+            f"(~${target_value:,.2f}, {self.HEDGE_WEIGHT:.0%} of portfolio)."
+        )
+
+    def _close_hedge(self):
+        """Cover the HEDGE_SYMBOL short opened by _open_hedge(), called
+        when the drawdown cooldown ends."""
+        if not self.hedge_active:
+            return
+        position = self.get_position(self.HEDGE_SYMBOL)
+        qty = abs(float(position.quantity)) if position and position.quantity else 0.0
+        if qty > 0:
+            order = self.create_order(self.HEDGE_SYMBOL, qty, "buy_to_cover")
+            self.submit_order(order)
+            self.log_message(f"[hedge] covered short {self.HEDGE_SYMBOL} qty={qty:.2f}.")
+        self.hedge_active = False

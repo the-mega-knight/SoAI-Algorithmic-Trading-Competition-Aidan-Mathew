@@ -48,6 +48,14 @@ DEFAULT_PARAMS = dict(
     max_drawdown_pct=0.25,
     cooldown_days=5,
     fee_bps=2.0,  # matches the official 2bps fee stated on the competition site
+    # Short-hedge variant (mirrors strategies/strategy.py HEDGE_SYMBOL/
+    # HEDGE_WEIGHT): when the breaker trips, short HEDGE_SYMBOL instead of
+    # just holding cash, sized at hedge_weight of portfolio value, covered
+    # when the cooldown ends. hedge_enabled=False reproduces the exact
+    # original long-only behavior.
+    hedge_enabled=False,
+    hedge_symbol="SPY",
+    hedge_weight=0.50,
 )
 
 
@@ -82,10 +90,16 @@ def momentum_weights(pos_roc, max_asset_weight, max_total_exposure):
 
 def run_backtest(params, start_cash=1_000_000, verbose=False, start_date=None, end_date=None):
     daily = {s: load_daily(s) for s in UNIVERSE}
+    hedge_enabled = params.get("hedge_enabled", False)
+    hedge_symbol = params.get("hedge_symbol", "SPY")
+    if hedge_enabled:
+        daily[hedge_symbol] = load_daily(hedge_symbol)
     common_index = None
     for s in UNIVERSE:
         idx = daily[s].index
         common_index = idx if common_index is None else common_index.intersection(idx)
+    if hedge_enabled:
+        common_index = common_index.intersection(daily[hedge_symbol].index)
     common_index = common_index.sort_values()
 
     mom_lb = params["mom_lookback"]
@@ -107,8 +121,13 @@ def run_backtest(params, start_cash=1_000_000, verbose=False, start_date=None, e
             "vol_spike_ratio": vol_spike_ratio, "gap_pct": gap_pct,
         })
 
+    hedge_close = None
+    if hedge_enabled:
+        hedge_close = daily[hedge_symbol]["close"].reindex(common_index)
+
     cash = start_cash
     qty = {s: 0.0 for s in UNIVERSE}
+    hedge_qty = 0.0  # negative-quantity convention: short position held as negative qty
     equity_curve = []
     peak = start_cash
     cooldown = 0
@@ -137,9 +156,40 @@ def run_backtest(params, start_cash=1_000_000, verbose=False, start_date=None, e
         base_weights = {}
         force_rebalance = True
 
+    def _open_hedge(port_value, hedge_price):
+        """Short hedge_symbol sized at hedge_weight of portfolio value.
+        Shorting proceeds are credited to cash immediately (standard
+        short-sale accounting); the mark-to-market liability shows up
+        via hedge_qty (negative) * price in port_value."""
+        nonlocal cash, trade_count, hedge_qty
+        if not hedge_enabled or hedge_qty != 0 or hedge_price is None or hedge_price != hedge_price or hedge_price <= 0:
+            return
+        target_value = params["hedge_weight"] * port_value
+        units = target_value / hedge_price
+        if units <= 0:
+            return
+        proceeds = units * hedge_price
+        fee = proceeds * fee_rate
+        cash += (proceeds - fee)
+        hedge_qty = -units
+        trade_count += 1
+
+    def _close_hedge(hedge_price):
+        nonlocal cash, trade_count, hedge_qty
+        if hedge_qty == 0:
+            return
+        units = abs(hedge_qty)
+        if hedge_price is not None and hedge_price == hedge_price and hedge_price > 0:
+            cost = units * hedge_price
+            fee = cost * fee_rate
+            cash -= (cost + fee)
+            trade_count += 1
+        hedge_qty = 0.0
+
     for dt in dates:
         prices = {s: sig[s].loc[dt, "close"] for s in UNIVERSE}
-        port_value = cash + sum(qty[s] * prices[s] for s in UNIVERSE)
+        hedge_price = hedge_close.loc[dt] if hedge_enabled else None
+        port_value = cash + sum(qty[s] * prices[s] for s in UNIVERSE) + hedge_qty * (hedge_price or 0.0)
         if port_value > peak:
             peak = port_value
         drawdown = port_value / peak - 1.0 if peak else 0.0
@@ -148,14 +198,16 @@ def run_backtest(params, start_cash=1_000_000, verbose=False, start_date=None, e
             cooldown -= 1
             _flatten_and_reset()
             if cooldown == 0:
+                _close_hedge(hedge_price)
                 peak = port_value
-            equity_curve.append((dt, cash))
+            equity_curve.append((dt, cash + hedge_qty * (hedge_price or 0.0)))
             continue
 
         if drawdown <= -params["max_drawdown_pct"]:
             _flatten_and_reset()
+            _open_hedge(port_value, hedge_price)
             cooldown = params["cooldown_days"]
-            equity_curve.append((dt, cash))
+            equity_curve.append((dt, cash + hedge_qty * (hedge_price or 0.0)))
             continue
 
         if force_rebalance or (day_index % params["rebalance_every"] == 0):
@@ -218,7 +270,7 @@ def run_backtest(params, start_cash=1_000_000, verbose=False, start_date=None, e
                 qty[s] -= sell_qty
                 trade_count += 1
 
-        port_value = cash + sum(qty[s] * prices[s] for s in UNIVERSE)
+        port_value = cash + sum(qty[s] * prices[s] for s in UNIVERSE) + hedge_qty * (hedge_price or 0.0)
         equity_curve.append((dt, port_value))
 
     ec = pd.Series({d: v for d, v in equity_curve}).sort_index()
