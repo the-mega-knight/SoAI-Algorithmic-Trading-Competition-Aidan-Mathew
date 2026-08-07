@@ -16,15 +16,18 @@ How to customise
 4. Make sure each symbol has a matching ``data/{SYMBOL}_1m_spot.csv``
    file before running ``python backtest.py``.
 
-The template ships with a single placeholder symbol (``EXAMPLE``) so the
-harness runs end-to-end out of the box against the sample CSV in ``data/``.
+NOTE: the template's placeholder ``EXAMPLE`` symbol has been removed below.
+Its CSV only spans 2026-08-01 -> 2026-08-29 with a flat $400 price, and
+because backtest.py clamps the run window to the INTERSECTION of every
+loaded symbol's date range, leaving it in (including as STOCK_BENCH /
+CRYPTO_BENCH, which also get loaded as data) silently truncated the real
+crypto backtest from the full ~1 month available (2026-07-06 -> 2026-08-05)
+down to just 5 days (2026-08-01 -> 08-05).
 """
 
 # Equity / spot tickers traded by the local backtest. Add your own symbols
 # here and drop the matching CSV files into ``data/``.
-STOCK_SLEEVE_SYMBOLS: list[str] = [
-    "EXAMPLE",
-]
+STOCK_SLEEVE_SYMBOLS: list[str] = []
 
 # Crypto tickers (quoted in USD). Leave empty if your strategy is stocks-only.
 CRYPTO_SLEEVE_SYMBOLS: list[str] = [
@@ -38,10 +41,12 @@ CRYPTO_SLEEVE_SYMBOLS: list[str] = [
     "ADA/USD",
 ]
 
-# Benchmark symbols. Used by Lumibot to render the comparison line on the
-# generated tearsheet HTML.
-STOCK_BENCH: str = "EXAMPLE"
-CRYPTO_BENCH: str = "EXAMPLE"
+# Benchmark symbols. Left blank - backtest.py now passes benchmark_asset=None
+# directly to avoid both the EXAMPLE-placeholder date clamp above and the
+# broken Lumibot Yahoo-Finance benchmark fetch (same bug already fixed on
+# the Aidan branch for BENCH5).
+STOCK_BENCH: str = ""
+CRYPTO_BENCH: str = ""
 
 # Derived set used by ``backtest.py`` to decide whether a loaded symbol
 # should be modelled as ``Asset.AssetType.CRYPTO`` vs ``STOCK``. Do not
