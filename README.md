@@ -65,13 +65,15 @@ allocation is only *recomputed* every 5 trading days. The risk throttle
 - **No-trade band**: only rebalance a name when the target position
   differs from the current one by more than 2% of portfolio value
 
-**Local validation on real historical data** (`vector_validate.py`, a
-from-scratch pandas re-implementation of the same rules, cross-checked
-against `python backtest.py` running the real Lumibot engine):
+**Local validation on real historical data**:
+
+`vector_validate.py`, a from-scratch pandas re-implementation of the same
+rules, cross-checked against `python backtest.py` running the real Lumibot
+engine:
 - **+73.1% terminal return, Sharpe 1.70, Sortino 2.75, max drawdown -15.9%**
   over a real ~436-day window (real daily OHLCV pulled via yfinance). A
-  separate full 2-year Lumibot run confirmed the same direction: +107%
-  total return, Sharpe 1.95, max drawdown -15.0%, against a +46% AAPL-only
+  separate 2-year Lumibot run confirmed the same direction: +107% total
+  return, Sharpe 1.95, max drawdown -15.0%, against a +46% AAPL-only
   benchmark over the same period.
 - Positive in **all three** sub-period thirds (+17.4%, +35.0%, +7.3%), not
   dependent on one lucky stretch.
@@ -86,19 +88,52 @@ against `python backtest.py` running the real Lumibot engine):
   does not beat GOOGL's standalone +123.9% buy-and-hold, which used no
   diversification or risk control at all.
 
+Full 10-year `backtest.py` run (all available daily history, verified
+7 August 2026): $1,000,000 grew to roughly $20.1M, a total return near
++1,910% and CAGR near +35% over 9.99 years, against a BENCH5 (5-stock
+equal-weight buy-and-hold) return of about +1,944% over the same window.
+The strategy still trails raw buy-and-hold by a small margin across the
+full decade, consistent with trading some upside for the downside
+protection described above.
+
+`seasonal_window_test.py` replays the exact 16 August to 16 September
+window the competition scores, across the eight most recently completed
+years. The strategy was positive in six of eight years and beat the
+five-stock buy-and-hold in five of eight. Two years stand out: 2022
+(-13.6%, still ahead of buy-and-hold's -17.9%) and 2024 (-11.6%, this
+time behind buy-and-hold's -1.2%). 2024 is worth a closer look before
+final submission, since it is the one case in eight years where the risk
+controls made the outcome worse rather than better.
+
+`regime_test.py` runs the strategy across six distinct multi-year
+periods. It gives up meaningful upside in every bull regime tested
+(pre-COVID, the COVID recovery, the 2021 melt-up, the 2023 to 2024 AI
+run), typically 15 to 30 points behind buy-and-hold, in exchange for a
+much shallower loss during the one bear regime tested (2022: -12.2% for
+the strategy versus -39.4% for buy-and-hold).
+
 **Known limitations, stated plainly**:
 - All validation above is against **historical** data ending in early
   August 2026. The official scored window (16 August - 15 September 2026)
   has not happened yet at the time of writing, and nothing guarantees it
   resembles the backtested period.
-- The drawdown circuit breaker has not fired in real-data validation (max
-  drawdown stayed at -15.9%, short of the 25% threshold), so whether it
-  works as intended in an actual severe drawdown is still unconfirmed on
-  real data.
+- The drawdown circuit breaker has still not fired in any validation run
+  described above. The closest approach was -22.5% during the 2022
+  bear-market regime test, short of the 25% threshold. Whether it behaves
+  as intended in an actual severe drawdown remains unconfirmed on real
+  data.
 - Five large-cap tech names are meaningfully correlated with each other;
   the strategy does not diversify across sectors or asset classes even
   though the competition permits a much wider universe (any CCXT crypto
   pair, or the full US equity universe via Massive).
+- The strategy is long-only. The organizers confirmed by email on
+  7 August 2026 that short selling (SELL_SHORT and BUY_TO_COVER) is
+  supported by the official execution engine, and that options contracts
+  are not supported (the asset universe is equity spot and crypto spot
+  only). Given the 2024 seasonal-window result above, a short leg or a
+  short-based hedge tied to the drawdown breaker is the most direct way
+  to address the strategy's one demonstrated weak spot, and is being
+  evaluated as a possible late change ahead of the submission deadline.
 - `requirements.txt` should be pinned to exact installed versions
   (`pip freeze`) before final submission, per the competition's stated
   reproducibility requirement.
@@ -137,6 +172,8 @@ SoAI-Algorithmic-Trading-Competition-Aidan-Mathew/
 ├── .gitignore
 ├── backtest.py                       # local backtest entrypoint (pandas / CSV, daily bars)
 ├── vector_validate.py                # independent pandas re-implementation for fast iteration
+├── regime_test.py                    # strategy performance across six historical market regimes
+├── seasonal_window_test.py           # strategy replayed over the exact competition dates, past 8 years
 ├── strategies/
 │   ├── strategy.py                   # OUR strategy (official entrypoint)
 │   ├── params.py                     # shared parameters for local backtests
@@ -159,8 +196,9 @@ Files the official environment relies on:
   reviewers can reproduce it.
 
 Everything else (the `backtest.py` / `vector_validate.py` harnesses, the
-`data/` folder, the example strategies) is provided for **your local
-development only** and is not used by the official evaluation.
+regime and seasonal test scripts, the `data/` folder, the example
+strategies) is provided for **your local development only** and is not
+used by the official evaluation.
 
 ---
 
@@ -265,6 +303,12 @@ A symbol is eligible if it satisfies **both** of the following:
      (BABA, PDD, TSM, ASML), and small / micro-cap / penny stocks.
 2. **You can source its historical data** for your local backtest.
 
+Short selling (`SELL_SHORT` / `BUY_TO_COVER`) is fully supported by the
+official execution engine, confirmed directly by the organizing committee
+by email on 7 August 2026. Options contracts are not supported on either
+asset class, for the same reason: a standardized evaluation framework and
+reliable data feed execution across every participating strategy.
+
 ### 📡 Official data source providers (August–September 2026 run)
 
 During the verification run (10–12 August 2026) and the official trading
@@ -312,9 +356,13 @@ unforgiving. Plan for the following gotchas before submission:
 This repo ships two local validation paths: a **Pandas / CSV** Lumibot
 backtest (`backtest.py`) and a **from-scratch pandas re-implementation**
 (`vector_validate.py`) used for fast parameter iteration and stress-testing
-without needing a full Lumibot install. The official competition score is
-**not** computed from either; this section is purely for your own
-development.
+without needing a full Lumibot install, plus two scripts built on top of
+`vector_validate.py` for robustness checks: `regime_test.py` (performance
+across six distinct historical market regimes) and
+`seasonal_window_test.py` (performance replayed over the exact competition
+calendar dates, in each of the past 8 years). The official competition
+score is **not** computed from any of these; this section is purely for
+your own development.
 
 Top-level reference: [Lumibot backtesting overview](https://lumibot.lumiwealth.com/backtesting.html).
 
@@ -347,9 +395,12 @@ a fresh clone needs to regenerate it before backtesting).
 python backtest.py
 ```
 
-The harness prints the date window it is testing and produces Lumibot's
-standard backtest output: a tearsheet HTML, a trades CSV, an indicators
-CSV, and a logs CSV — see
+The harness prints the date window it is testing, followed by a terminal
+results summary (initial budget, final portfolio value, total return,
+CAGR, BENCH5 buy-and-hold comparison, max drawdown, and an approximate
+Sharpe ratio, all computed from local data with no network dependency),
+and then produces Lumibot's standard backtest output: a tearsheet HTML, a
+trades CSV, an indicators CSV, and a logs CSV — see
 [Files Generated from Backtesting](https://lumibot.lumiwealth.com/backtesting.html#files-generated-from-backtesting)
 for the full list. Adjust budget, fees, slippage, and the date window at
 the top of [`backtest.py`](backtest.py).
@@ -367,7 +418,27 @@ disabled), sub-period robustness, and a buy-and-hold benchmark comparison,
 the full workflow from `trading-backtest-methodology`. Useful for
 iterating quickly since it doesn't require a Lumibot install.
 
-### 6.3 Other Lumibot backtest modes
+### 6.3 `regime_test.py` and `seasonal_window_test.py`
+
+```bash
+python regime_test.py
+python seasonal_window_test.py
+```
+
+Both build on `vector_validate.py` and require the full 10 years of daily
+data from `scripts/fetch_stock_data.py`. `regime_test.py` runs the
+strategy across six distinct market regimes (pre-COVID bull, COVID crash
+and recovery, the 2021 melt-up, the 2022 rate-hike bear market, the 2023
+to 2024 AI bull run, and the most recent 12 months) so the strategy isn't
+judged on a single window it happened to be tuned against.
+`seasonal_window_test.py` instead holds the window length and calendar
+dates fixed at 16 August to 16 September, matching the competition's
+scored period, and replays that exact slice in each of the past 8 years.
+Neither script feeds its results back into the strategy's logic; both are
+descriptive context for the risk-appetite conversation, not a timing
+signal.
+
+### 6.4 Other Lumibot backtest modes
 
 Lumibot supports several other backtest modes — pick one that matches the
 asset class and data source you prefer:
@@ -381,7 +452,7 @@ asset class and data source you prefer:
 | **ThetaData** | Stocks / options / index, intraday | Subscription | [ThetaData](https://lumibot.lumiwealth.com/backtesting.thetadata.html) |
 | **Interactive Brokers (REST)** | Futures, crypto via IBKR Gateway | IBKR account | [IBKR REST](https://lumibot.lumiwealth.com/backtesting.interactive_brokers_rest.html) |
 
-### 6.4 Fetching market data
+### 6.5 Fetching market data
 
 This repo uses `scripts/fetch_stock_data.py` (yfinance, daily bars, no API
 key needed). Whatever source you use, remember the **fairness rule**: the
@@ -460,8 +531,8 @@ N, "day")`, one of the explicitly supported cadences).
 
 Bars are sourced via **CCXT** (crypto spot pairs) and **Massive** (US
 equities and ETFs) — see [§5 — Asset Universe & Data Sources](#5-asset-universe--data-sources)
-for the full tradable universe and the liquidity / data caveats that come
-with it.
+for the full tradable universe, the confirmed short-selling support, and
+the liquidity / data caveats that come with it.
 
 > 🛡️ Because every team sees the same minimal information set, the
 > winning strategies are the ones that stay **robust across regimes**
