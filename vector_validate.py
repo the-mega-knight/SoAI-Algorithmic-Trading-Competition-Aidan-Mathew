@@ -48,6 +48,12 @@ DEFAULT_PARAMS = dict(
     max_drawdown_pct=0.25,
     cooldown_days=5,
     fee_bps=2.0,  # matches the official 2bps fee stated on the competition site
+    # Long/short variant (mirrors strategies/strategy.py): also short
+    # negative-ROC names, sized symmetrically to the long book (same
+    # max_asset_weight / max_total_exposure, applied independently to
+    # each book). short_enabled=False reproduces the original long-only
+    # behavior exactly.
+    short_enabled=False,
 )
 
 
@@ -57,13 +63,15 @@ def load_daily(symbol):
     return df[["open", "high", "low", "close", "volume"]]
 
 
-def momentum_weights(pos_roc, max_asset_weight, max_total_exposure):
-    if not pos_roc:
+def _capped_weights(roc_magnitudes, max_asset_weight, max_total_exposure):
+    """Shared sizing algorithm for one book (long or short); see
+    momentum_weights below. roc_magnitudes must be non-negative."""
+    if not roc_magnitudes:
         return {}
-    total = sum(pos_roc.values())
+    total = sum(roc_magnitudes.values())
     if total <= 0:
         return {}
-    weights = {s: v / total for s, v in pos_roc.items()}
+    weights = {s: v / total for s, v in roc_magnitudes.items()}
     for _ in range(len(weights) + 1):
         over = {s: w for s, w in weights.items() if w > max_asset_weight}
         if not over:
@@ -78,6 +86,23 @@ def momentum_weights(pos_roc, max_asset_weight, max_total_exposure):
             for s in under:
                 weights[s] = (under[s] / under_total) * remaining
     return {s: w * max_total_exposure for s, w in weights.items()}
+
+
+def momentum_weights(pos_roc, max_asset_weight, max_total_exposure, neg_roc=None):
+    """Long book from pos_roc (positive weights), plus - when neg_roc is
+    given (long/short variant) - a short book from neg_roc (negative
+    weights), sized with the identical capped algorithm applied
+    independently to each book. See strategies/strategy.py's
+    _momentum_weights/_capped_weights for the Lumibot-side mirror of this
+    same logic."""
+    long_weights = _capped_weights(pos_roc, max_asset_weight, max_total_exposure)
+    if not neg_roc:
+        return long_weights
+    short_weights = _capped_weights(neg_roc, max_asset_weight, max_total_exposure)
+    combined = dict(long_weights)
+    for s, w in short_weights.items():
+        combined[s] = -w
+    return combined
 
 
 def run_backtest(params, start_cash=1_000_000, verbose=False, start_date=None, end_date=None):
@@ -133,9 +158,62 @@ def run_backtest(params, start_cash=1_000_000, verbose=False, start_date=None, e
                 cash += qty[s] * prices[s] * (1 - fee_rate)
                 trade_count += 1
                 qty[s] = 0.0
+            elif qty[s] < 0:
+                # Long/short variant: cover shorts too, not just sell
+                # longs, or the breaker leaves a short running unmanaged
+                # through the drawdown it exists to protect against.
+                cost = abs(qty[s]) * prices[s]
+                cash -= cost * (1 + fee_rate)
+                trade_count += 1
+                qty[s] = 0.0
             gap_cooldown[s] = 0
         base_weights = {}
         force_rebalance = True
+
+    def _apply_qty_delta(s, delta_qty, price):
+        nonlocal cash, trade_count
+        current = qty[s]
+        remaining = delta_qty
+        if remaining > 0:
+            if current < 0:
+                cover_qty = min(remaining, -current)
+                if cover_qty > 0:
+                    cost = cover_qty * price
+                    fee = cost * fee_rate
+                    cash -= (cost + fee)
+                    qty[s] += cover_qty
+                    trade_count += 1
+                    remaining -= cover_qty
+            if remaining > 0:
+                affordable = cash / price
+                buy_qty = min(remaining, affordable)
+                if buy_qty > 0:
+                    cost = buy_qty * price
+                    fee = cost * fee_rate
+                    if cost + fee > cash:
+                        buy_qty = cash / (price * (1 + fee_rate))
+                        cost = buy_qty * price
+                        fee = cost * fee_rate
+                    cash -= (cost + fee)
+                    qty[s] += buy_qty
+                    trade_count += 1
+        elif remaining < 0:
+            need = -remaining
+            if current > 0:
+                sell_qty = min(need, current)
+                if sell_qty > 0:
+                    proceeds = sell_qty * price
+                    fee = proceeds * fee_rate
+                    cash += (proceeds - fee)
+                    qty[s] -= sell_qty
+                    trade_count += 1
+                    need -= sell_qty
+            if need > 0:
+                proceeds = need * price
+                fee = proceeds * fee_rate
+                cash += (proceeds - fee)
+                qty[s] -= need
+                trade_count += 1
 
     for dt in dates:
         prices = {s: sig[s].loc[dt, "close"] for s in UNIVERSE}
@@ -158,21 +236,33 @@ def run_backtest(params, start_cash=1_000_000, verbose=False, start_date=None, e
             equity_curve.append((dt, cash))
             continue
 
+        short_enabled = params.get("short_enabled", False)
         if force_rebalance or (day_index % params["rebalance_every"] == 0):
             pos_roc = {
                 s: sig[s].loc[dt, "roc"] for s in UNIVERSE
                 if sig[s].loc[dt, "roc"] == sig[s].loc[dt, "roc"] and sig[s].loc[dt, "roc"] > 0
             }
-            base_weights = momentum_weights(pos_roc, params["max_asset_weight"], params["max_total_exposure"])
+            neg_roc = {}
+            if short_enabled:
+                neg_roc = {
+                    s: -sig[s].loc[dt, "roc"] for s in UNIVERSE
+                    if sig[s].loc[dt, "roc"] == sig[s].loc[dt, "roc"] and sig[s].loc[dt, "roc"] < 0
+                }
+            base_weights = momentum_weights(
+                pos_roc, params["max_asset_weight"], params["max_total_exposure"], neg_roc=neg_roc
+            )
             force_rebalance = False
         day_index += 1
 
         target_weights = {}
         for s in UNIVERSE:
             w = base_weights.get(s, 0.0)
-            if w <= 0:
+            if w == 0:
                 target_weights[s] = 0.0
                 continue
+            # throttle is a magnitude multiplier in [0,1], applied
+            # regardless of sign - shrinks toward flat, never flips
+            # direction.
             throttle = 1.0
             spike = sig[s].loc[dt, "vol_spike_ratio"]
             if spike == spike and spike > params["vol_spike_multiplier"]:
@@ -194,29 +284,7 @@ def run_backtest(params, start_cash=1_000_000, verbose=False, start_date=None, e
             if abs(delta_value) < params["min_rebalance_pct"] * max(port_value, 1.0):
                 continue
             delta_qty = delta_value / price
-            if delta_qty > 0:
-                affordable = cash / price
-                delta_qty = min(delta_qty, affordable)
-                if delta_qty <= 0:
-                    continue
-                cost = delta_qty * price
-                fee = cost * fee_rate
-                if cost + fee > cash:
-                    delta_qty = cash / (price * (1 + fee_rate))
-                    cost = delta_qty * price
-                    fee = cost * fee_rate
-                cash -= (cost + fee)
-                qty[s] += delta_qty
-                trade_count += 1
-            else:
-                sell_qty = min(abs(delta_qty), qty[s])
-                if sell_qty <= 0:
-                    continue
-                proceeds = sell_qty * price
-                fee = proceeds * fee_rate
-                cash += (proceeds - fee)
-                qty[s] -= sell_qty
-                trade_count += 1
+            _apply_qty_delta(s, delta_qty, price)
 
         port_value = cash + sum(qty[s] * prices[s] for s in UNIVERSE)
         equity_curve.append((dt, port_value))

@@ -44,10 +44,31 @@ Universe:         AAPL, MSFT, GOOGL, AMZN, NVDA (see STOCK_UNIVERSE)
 Cadence:          checked once per day (self.sleeptime = "1D"), but the
                   target allocation is only recomputed every
                   REBALANCE_EVERY_DAYS trading days
-Entry signal:     30-day rate of change > 0 (MOM_LOOKBACK_DAYS)
-Weighting:        proportional to each qualifying name's own ROC (not
+Entry signal:     30-day rate of change > 0 (MOM_LOOKBACK_DAYS) opens/holds
+                  a long; ROC < 0 opens/holds a short (see "Long/short
+                  variant" below). A flat ROC (exactly 0 or NaN) holds no
+                  position either direction.
+Weighting:        proportional to each qualifying name's own |ROC| (not
                   inverse-volatility - see below), capped at
-                  MAX_ASSET_WEIGHT per name and MAX_TOTAL_EXPOSURE total
+                  MAX_ASSET_WEIGHT per name and MAX_TOTAL_EXPOSURE total,
+                  applied independently to the long book and the short
+                  book (see below).
+
+Long/short variant (v4): the original strategy only ever went long or
+                  flat. This version extends _momentum_weights to also
+                  size short positions for negative-ROC names,
+                  symmetrically to how positive-ROC names are sized long
+                  - same per-name cap (MAX_ASSET_WEIGHT), same total-book
+                  cap (MAX_TOTAL_EXPOSURE), just applied to the short book
+                  independently. That means gross exposure (long + short)
+                  can now reach up to ~2x MAX_TOTAL_EXPOSURE if the
+                  universe splits evenly between positive- and
+                  negative-momentum names, versus the original's max of
+                  1x. This is a materially larger risk profile than the
+                  long-only version and has not been validated against
+                  real market data as of this commit (see
+                  README/handover notes) - treat it as a research variant
+                  until backtested.
 Risk throttle:    checked every day regardless of rebalance schedule,
                   using only OHLCV data:
                     - if 20-day realized vol > VOL_SPIKE_MULTIPLIER x its
@@ -242,17 +263,25 @@ class Strategy(_LumibotStrategy):
         #    reset, via force_rebalance).
         if self.force_rebalance or (self.day_index % self.REBALANCE_EVERY_DAYS == 0):
             pos_roc = {}
+            neg_roc = {}
             for symbol in self.STOCK_UNIVERSE:
                 df = bars_by_symbol[symbol]
                 if df is None or len(df) < self.MOM_LOOKBACK_DAYS + 1:
                     continue
                 roc = df["close"].iloc[-1] / df["close"].iloc[-1 - self.MOM_LOOKBACK_DAYS] - 1
-                if roc == roc and roc > 0:  # NaN-safe
+                if roc != roc:  # NaN-safe
+                    continue
+                if roc > 0:
                     pos_roc[symbol] = roc
-            self.base_weights = self._momentum_weights(pos_roc)
+                elif roc < 0:
+                    neg_roc[symbol] = -roc  # magnitude, sign re-applied in _momentum_weights
+            self.base_weights = self._momentum_weights(pos_roc, neg_roc)
             self.force_rebalance = False
             if self._DEBUG_SIGNALS:
-                self.log_message(f"[DEBUG] rebalanced. pos_roc={pos_roc} base_weights={self.base_weights}")
+                self.log_message(
+                    f"[DEBUG] rebalanced. pos_roc={pos_roc} neg_roc={neg_roc} "
+                    f"base_weights={self.base_weights}"
+                )
         self.day_index += 1
 
         # -- Step 4: daily risk throttle, applied every iteration
@@ -261,10 +290,14 @@ class Strategy(_LumibotStrategy):
         target_weights = {}
         for symbol in self.STOCK_UNIVERSE:
             w = self.base_weights.get(symbol, 0.0)
-            if w <= 0:
+            if w == 0:
                 target_weights[symbol] = 0.0
                 continue
 
+            # throttle is a magnitude multiplier in [0, 1] applied to w
+            # regardless of sign, so it shrinks both long and short
+            # positions toward flat under the same vol/gap risk signals -
+            # it never flips a position's direction.
             throttle = 1.0
             df = bars_by_symbol[symbol]
 
@@ -360,21 +393,45 @@ class Strategy(_LumibotStrategy):
     # ------------------------------------------------------------------
     # Position sizing
     # ------------------------------------------------------------------
-    def _momentum_weights(self, pos_roc):
+    def _momentum_weights(self, pos_roc, neg_roc=None):
         """
-        weight_i = roc_i / sum(roc_j) among names with positive momentum,
-        then capped at MAX_ASSET_WEIGHT per name and rescaled so the total
-        never exceeds MAX_TOTAL_EXPOSURE. Momentum-proportional rather than
-        inverse-volatility on purpose - see the module docstring.
+        Long book: weight_i = roc_i / sum(roc_j) among positive-momentum
+        names, capped at MAX_ASSET_WEIGHT per name and rescaled so the
+        book total never exceeds MAX_TOTAL_EXPOSURE.
+
+        Short book (v4, long/short variant): the same algorithm, applied
+        independently to negative-momentum names using |roc|, then negated
+        - same per-name and per-book caps as the long side, by design (see
+        "Long/short variant" in the module docstring). Momentum-
+        proportional rather than inverse-volatility on purpose - see the
+        module docstring.
+
+        Returns a single dict keyed by symbol: positive weight = long,
+        negative weight = short. A symbol can never appear in both
+        pos_roc and neg_roc (a name's ROC has one sign), so there's no
+        collision to resolve.
         """
-        if not pos_roc:
+        long_weights = self._capped_weights(pos_roc)
+        short_weights = self._capped_weights(neg_roc or {})
+        combined = dict(long_weights)
+        for s, w in short_weights.items():
+            combined[s] = -w
+        return combined
+
+    def _capped_weights(self, roc_magnitudes):
+        """Shared sizing algorithm for one book (long or short): weight_i
+        = roc_i / sum(roc_j), capped at MAX_ASSET_WEIGHT per name and
+        rescaled so the book total never exceeds MAX_TOTAL_EXPOSURE.
+        roc_magnitudes must be non-negative (sign is applied by the
+        caller)."""
+        if not roc_magnitudes:
             return {}
 
-        total = sum(pos_roc.values())
+        total = sum(roc_magnitudes.values())
         if total <= 0:
             return {}
 
-        weights = {s: v / total for s, v in pos_roc.items()}
+        weights = {s: v / total for s, v in roc_magnitudes.items()}
         for _ in range(len(weights) + 1):
             over = {s: w for s, w in weights.items() if w > self.MAX_ASSET_WEIGHT}
             if not over:
@@ -404,6 +461,12 @@ class Strategy(_LumibotStrategy):
         return float(position.quantity), float(position.quantity) * float(price)
 
     def _rebalance_to_weight(self, symbol, target_weight, portfolio_value):
+        """Move symbol's position toward target_weight * portfolio_value.
+        target_weight (and therefore current/target position value) can
+        be negative in the long/short variant, meaning a short position -
+        see _execute_qty_delta for how a change that crosses through zero
+        (e.g. covering a short and going long in the same rebalance) is
+        split into the correct pair of orders."""
         price = self.get_last_price(symbol)
         if price is None or price <= 0:
             return  # no tradable price this iteration, skip safely
@@ -416,31 +479,64 @@ class Strategy(_LumibotStrategy):
             return  # inside the no-trade band, avoid churn and fees on noise
 
         delta_qty = delta_value / price
-        if delta_qty > 0:
-            cash = self.get_cash()
-            if cash is None:
-                self.log_message(
-                    f"get_cash() returned None while sizing a {symbol} buy. Skipping."
-                )
-                return
-            affordable_qty = cash / price
-            delta_qty = min(delta_qty, affordable_qty)
-            if delta_qty <= 0:
-                return
-            order = self.create_order(symbol, delta_qty, "buy")
-            self.submit_order(order)
-        else:
-            sell_qty = min(abs(delta_qty), current_qty) if current_qty else 0
-            if sell_qty <= 0:
-                return
-            order = self.create_order(symbol, sell_qty, "sell")
-            self.submit_order(order)
+        self._execute_qty_delta(symbol, current_qty, delta_qty, price)
+
+    def _execute_qty_delta(self, symbol, current_qty, delta_qty, price):
+        """Apply a signed change in share quantity to a position that may
+        currently be long, short, or flat, splitting the change into up
+        to two orders when it crosses through zero (e.g. current_qty=-100
+        short, delta_qty=+150 -> buy_to_cover 100, then buy 50)."""
+        current_qty = current_qty or 0.0
+        remaining = delta_qty
+
+        if remaining > 0:
+            # Increasing net quantity: cover any existing short first,
+            # then use whatever's left to open/add to a long.
+            if current_qty < 0:
+                cover_qty = min(remaining, -current_qty)
+                if cover_qty > 0:
+                    order = self.create_order(symbol, cover_qty, "buy_to_cover")
+                    self.submit_order(order)
+                    remaining -= cover_qty
+            if remaining > 0:
+                cash = self.get_cash()
+                if cash is None:
+                    self.log_message(
+                        f"get_cash() returned None while sizing a {symbol} buy. Skipping."
+                    )
+                    return
+                affordable_qty = cash / price
+                buy_qty = min(remaining, affordable_qty)
+                if buy_qty > 0:
+                    order = self.create_order(symbol, buy_qty, "buy")
+                    self.submit_order(order)
+
+        elif remaining < 0:
+            # Decreasing net quantity: sell off any existing long first,
+            # then use whatever's left to open/add to a short.
+            need = -remaining
+            if current_qty > 0:
+                sell_qty = min(need, current_qty)
+                if sell_qty > 0:
+                    order = self.create_order(symbol, sell_qty, "sell")
+                    self.submit_order(order)
+                    need -= sell_qty
+            if need > 0:
+                order = self.create_order(symbol, need, "sell_short")
+                self.submit_order(order)
 
     def _flatten_and_reset(self):
         for symbol in self.STOCK_UNIVERSE:
             qty, _ = self._current_position_value(symbol)
             if qty and qty > 0:
                 order = self.create_order(symbol, qty, "sell")
+                self.submit_order(order)
+            elif qty and qty < 0:
+                # v4 (long/short variant): the circuit breaker must also
+                # cover shorts, not just sell longs, or it would leave a
+                # short position running unmanaged through the exact
+                # drawdown event it exists to protect against.
+                order = self.create_order(symbol, abs(qty), "buy_to_cover")
                 self.submit_order(order)
             self.gap_cooldown[symbol] = 0
         self.base_weights = {}
