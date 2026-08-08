@@ -64,7 +64,7 @@ allocation is only *recomputed* every 5 trading days. The risk throttle
 - **Known-event derisk** (one narrow, disclosed exception to "no calendar
   data"): NVDA's own publicly scheduled earnings date is hardcoded
   (`EARNINGS_RISK_DATES`) and that name's weight is proactively halved on
-  that one date. This is symmetric and non-predictive — it does not bet on
+  that one date. This is symmetric and non-predictive: it does not bet on
   the report's direction, only shrinks size ahead of a known single-stock
   binary event. If the date list is ever empty or stale, the strategy
   trades exactly as if this rule did not exist.
@@ -77,8 +77,8 @@ allocation is only *recomputed* every 5 trading days. The risk throttle
   recovery value rather than the pre-crash high, so the breaker cannot
   permanently lock the strategy out of the market after a single drawdown
   (a bug caught and fixed during validation). This hedge only fires under
-  the same rare drawdown condition as before — it has not fired in any
-  validation run to date, closest approach was -22.5% — so day-to-day
+  the same rare drawdown condition as before. It has not fired in any
+  validation run to date (closest approach was -22.5%), so day-to-day
   long-only behavior is unchanged; it only changes what happens in the
   tail case.
 - **No-trade band**: only rebalance a name when the target position
