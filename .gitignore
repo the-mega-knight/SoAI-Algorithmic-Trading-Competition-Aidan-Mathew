@@ -1,0 +1,22 @@
+# Environment / secrets
+.env
+*.pem
+*.key
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+.venv/
+venv/
+env/
+
+# Local backtest data (regenerate via scripts/fetch_stock_data.py)
+data/
+
+# Backtest outputs
+logs/
+
+# OS
+.DS_Store
+Thumbs.db
