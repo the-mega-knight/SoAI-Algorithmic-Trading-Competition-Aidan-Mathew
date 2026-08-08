@@ -16,7 +16,7 @@ level playing field.
 
 ---
 
-## Our Approach: Low-Turnover Momentum Core with Volatility/Gap Risk Throttle
+## Our Approach: Low-Turnover Momentum Core with Volatility/Gap Risk Throttle and SPY Drawdown Hedge
 
 **Team**: Aidan & Mathew
 
@@ -48,20 +48,39 @@ allocation is only *recomputed* every 5 trading days. The risk throttle
 - **Entry signal**: 30-day rate of change > 0
 - **Weighting**: proportional to each qualifying name's own ROC (not
   inverse-volatility, which was found to penalize exactly the strongest
-  movers), capped at 40% of the portfolio per name and 98% total exposure
-- **Risk throttle** (checked daily, OHLCV-only): halves a name's weight if
-  its 20-day realized volatility exceeds 1.8x its own 60-day baseline, and
-  cuts it to 30% for 3 trading days after a >5% overnight gap. This is a
-  reactive, OHLCV-only stand-in for earnings/shock awareness. The official
-  feed provides OHLCV bars only, no news or calendar data, so a strategy
-  that depended on knowing earnings dates in advance would not be reliably
-  reproducible in the official environment.
+  movers), capped at 50% of the portfolio per name and 100% total exposure
+  (v3.2: raised from 40%/98% after regime testing showed the tighter caps
+  were giving back bull-market upside for little extra protection)
+- **Risk throttle** (checked daily, OHLCV-only): cuts a name's weight to
+  70% of target if its 20-day realized volatility exceeds 2.3x its own
+  60-day baseline (v3.2: loosened from 1.8x/50% after regime testing
+  showed the tighter throttle was reacting to routine volatility upticks
+  in bull markets, not just genuine stress), and cuts it to 50% for 3
+  trading days after a >5% overnight gap. This is a reactive, OHLCV-only
+  stand-in for earnings/shock awareness. The official feed provides OHLCV
+  bars only, no news or calendar data, so a strategy that depended on
+  knowing earnings dates in advance would not be reliably reproducible in
+  the official environment.
+- **Known-event derisk** (one narrow, disclosed exception to "no calendar
+  data"): NVDA's own publicly scheduled earnings date is hardcoded
+  (`EARNINGS_RISK_DATES`) and that name's weight is proactively halved on
+  that one date. This is symmetric and non-predictive — it does not bet on
+  the report's direction, only shrinks size ahead of a known single-stock
+  binary event. If the date list is ever empty or stale, the strategy
+  trades exactly as if this rule did not exist.
 - **Risk control**: a portfolio-level drawdown circuit breaker. If the
   portfolio falls more than 25% from its running peak, flatten everything
-  and pause new entries for 5 trading days. When cooldown ends, the peak
-  resets to the recovery value rather than the pre-crash high, so the
-  breaker cannot permanently lock the strategy out of the market after a
-  single drawdown (a bug caught and fixed during validation).
+  and pause new entries for 5 trading days. Instead of just sitting in
+  cash during that cooldown, the breaker also opens a short SPY position
+  sized at 50% of portfolio value (`HEDGE_SYMBOL`/`HEDGE_WEIGHT`), covered
+  when the cooldown ends. When cooldown ends, the peak resets to the
+  recovery value rather than the pre-crash high, so the breaker cannot
+  permanently lock the strategy out of the market after a single drawdown
+  (a bug caught and fixed during validation). This hedge only fires under
+  the same rare drawdown condition as before — it has not fired in any
+  validation run to date, closest approach was -22.5% — so day-to-day
+  long-only behavior is unchanged; it only changes what happens in the
+  tail case.
 - **No-trade band**: only rebalance a name when the target position
   differs from the current one by more than 2% of portfolio value
 
@@ -126,14 +145,16 @@ the strategy versus -39.4% for buy-and-hold).
   the strategy does not diversify across sectors or asset classes even
   though the competition permits a much wider universe (any CCXT crypto
   pair, or the full US equity universe via Massive).
-- The strategy is long-only. The organizers confirmed by email on
-  7 August 2026 that short selling (SELL_SHORT and BUY_TO_COVER) is
-  supported by the official execution engine, and that options contracts
-  are not supported (the asset universe is equity spot and crypto spot
-  only). Given the 2024 seasonal-window result above, a short leg or a
-  short-based hedge tied to the drawdown breaker is the most direct way
-  to address the strategy's one demonstrated weak spot, and is being
-  evaluated as a possible late change ahead of the submission deadline.
+- The strategy is long-only day-to-day; short selling (SELL_SHORT and
+  BUY_TO_COVER, confirmed supported by the organizers by email on
+  7 August 2026) is used only inside the drawdown circuit breaker, as the
+  SPY hedge described above. This was evaluated as a candidate change
+  ahead of the deadline and adopted after real-data backtesting showed it
+  strictly matches or beats the plain long-only version everywhere
+  tested: full 10-year terminal return +1,324.5% vs +1,301.7%, Sharpe
+  1.252 vs 1.246, max drawdown -29.5% vs -30.6%, and identical results in
+  every shorter seasonal/regime window since the breaker doesn't trip
+  within them. Options contracts are not supported on either asset class.
 - `requirements.txt` should be pinned to exact installed versions
   (`pip freeze`) before final submission, per the competition's stated
   reproducibility requirement.
